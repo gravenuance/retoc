@@ -174,10 +174,36 @@ impl FNameMap {
         let n = &self.names[name.index() as usize];
         if name.number != 0 { format!("{n}_{}", name.number - 1).into() } else { n.into() }
     }
+    /// Like `get`, but returns the base string and number separately instead of formatting them
+    /// together - see `store_exact`'s doc comment for why the combined display string is lossy
+    /// to re-store elsewhere.
+    pub fn get_parts(&self, name: FMappedName) -> (&str, i32) {
+        assert_eq!(name.kind(), self.kind, "Attempt to map name of the different kind in this name map Name Kind is {}, but name map kind is {}", name.kind(), self.kind);
+        (&self.names[name.index() as usize], name.number as i32)
+    }
 
     pub fn store(&mut self, name: &str) -> FMappedName {
         let (name_without_number, name_number) = break_down_name_string(name);
+        self.store_parts(name_without_number, name_number)
+    }
 
+    /// Stores a name verbatim, without applying the "trailing digits after an underscore are a
+    /// duplicate-avoidance number suffix" heuristic `store` uses. A package's own full name (or
+    /// any other identifier known to be a real, complete string rather than an in-memory FName
+    /// that may have picked up a numbered suffix) must use this - `store` would otherwise
+    /// misinterpret a name that simply *ends* in digits (e.g. "SK_1031_1031316", a real asset
+    /// name whose trailing segment is a costume ID, not a duplicate count) as `("SK_1031",
+    /// 1031317)`, corrupting the name. Confirmed against a real cooked package: its own name is
+    /// stored with `number: 0` even though the string ends in a clean numeric run.
+    pub fn store_exact(&mut self, name: &str) -> FMappedName {
+        self.store_parts(name, 0)
+    }
+
+    /// Stores an already-split (base, number) pair verbatim - the counterpart to
+    /// `FPackageNameMap::get_parts` on the legacy side, so a name can move from one name map to
+    /// another without round-tripping through a display string (see `store_exact`'s doc comment
+    /// for why that round trip is lossy).
+    pub fn store_parts(&mut self, name_without_number: &str, name_number: i32) -> FMappedName {
         // Attempt to resolve the existing name through lookup
         if let Some(existing_index) = self.name_lookup.get(name_without_number) {
             return FMappedName::create((*existing_index) as u32, self.kind, name_number as u32);

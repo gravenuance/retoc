@@ -646,9 +646,24 @@ impl FPackageNameMap {
         let bare_name = self.names.get(name.index as usize).with_context(|| format!("invalid FName index {}", name.index))?;
         Ok(if name.number != 0 { format!("{bare_name}_{}", name.number - 1).into() } else { bare_name.into() })
     }
+    /// Like `get`, but returns the base string and number separately instead of formatting them
+    /// together - lets a caller re-store the name elsewhere without round-tripping through a
+    /// display string, which is lossy whenever the base string itself ends in what looks like a
+    /// duplicate-avoidance numeric suffix (e.g. an asset legitimately named "..._1031316").
+    pub fn get_parts(&self, name: FMinimalName) -> Result<(&str, i32)> {
+        let bare_name = self.names.get(name.index as usize).with_context(|| format!("invalid FName index {}", name.index))?;
+        Ok((bare_name.as_str(), name.number))
+    }
     pub fn store(&mut self, name: &str) -> FMinimalName {
         let (name_without_number, name_number) = break_down_name_string(name);
+        self.store_parts(name_without_number, name_number)
+    }
 
+    /// Stores an already-split (base, number) pair verbatim - the counterpart to `get_parts` and
+    /// to the zen name map's own `store_parts`, so a name can move between the two formats
+    /// without round-tripping through a display string (see `FNameMap::store_exact`'s doc
+    /// comment in `name_map.rs` for why that round trip corrupts a name like "..._1031316").
+    pub fn store_parts(&mut self, name_without_number: &str, name_number: i32) -> FMinimalName {
         // Attempt to resolve the existing name through lookup
         if let Some(existing_index) = self.name_lookup.get(name_without_number) {
             return FMinimalName { index: *existing_index as i32, number: name_number };

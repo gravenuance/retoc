@@ -161,7 +161,7 @@ fn setup_zen_package_summary(builder: &mut ZenPackageBuilder) -> anyhow::Result<
     if builder.container_header_version <= EIoContainerHeaderVersion::Initial {
         // Require a source package name be either found or supplied externally from somewhere
         let source_package_name = builder.source_package_name.as_deref().expect("source_package_name required");
-        builder.zen_package.summary.source_name = builder.zen_package.name_map.store(source_package_name);
+        builder.zen_package.summary.source_name = builder.zen_package.name_map.store_exact(source_package_name);
     }
 
     // Copy bulk resources from the legacy package without modifications
@@ -402,14 +402,15 @@ fn build_zen_export_map(builder: &mut ZenPackageBuilder) -> anyhow::Result<()> {
     for export_index in 0..builder.legacy_package.exports.len() {
         let object_export = builder.legacy_package.exports[export_index].clone();
         let total_header_size = builder.legacy_package.summary.versioning_info.total_header_size as u64;
-        let object_name = builder.legacy_package.name_map.get(object_export.object_name)?.to_string();
+        let (object_name_base, object_name_number) = builder.legacy_package.name_map.get_parts(object_export.object_name)?;
+        let (object_name_base, object_name_number) = (object_name_base.to_string(), object_name_number);
 
         let mut cooked_serial_offset = object_export.serial_offset as u64;
         if builder.container_header_version > EIoContainerHeaderVersion::Initial {
             // Zen cooked serial offset does not include header size, but legacy asset one does
             cooked_serial_offset -= total_header_size;
         }
-        let mapped_object_name = builder.zen_package.name_map.store(&object_name);
+        let mapped_object_name = builder.zen_package.name_map.store_parts(&object_name_base, object_name_number);
 
         let outer_index = remap_package_index_reference(builder, object_export.outer_index);
         let class_index = remap_package_index_reference(builder, object_export.class_index);
@@ -461,8 +462,9 @@ fn build_zen_export_map(builder: &mut ZenPackageBuilder) -> anyhow::Result<()> {
         let serial_layout_size: u64 = cell_export.serial_layout_size as u64;
         let serial_size: u64 = cell_export.serial_size as u64;
 
-        let cpp_class_info = builder.legacy_package.name_map.get(cell_export.cpp_class_info)?.to_string();
-        let mapped_cpp_class_info = builder.zen_package.name_map.store(&cpp_class_info);
+        let (cpp_class_info_base, cpp_class_info_number) = builder.legacy_package.name_map.get_parts(cell_export.cpp_class_info)?;
+        let (cpp_class_info_base, cpp_class_info_number) = (cpp_class_info_base.to_string(), cpp_class_info_number);
+        let mapped_cpp_class_info = builder.zen_package.name_map.store_parts(&cpp_class_info_base, cpp_class_info_number);
 
         // Export hash is zero if the verse path is empty, otherwise it is calculated from the verse path
         let public_export_hash: u64 = if !cell_export.verse_path.is_empty() { get_cell_export_hash(&cell_export.verse_path) } else { 0 };
@@ -1308,9 +1310,9 @@ fn build_zen_asset_internal<'a>(
 
     // Finally store and set package summary name
     if builder.container_header_version > EIoContainerHeaderVersion::Initial {
-        builder.zen_package.summary.name = builder.zen_package.name_map.store(&builder.legacy_package.summary.package_name);
+        builder.zen_package.summary.name = builder.zen_package.name_map.store_exact(&builder.legacy_package.summary.package_name);
     } else {
-        builder.zen_package.summary.name = builder.zen_package.name_map.store(builder.source_package_name.as_deref().unwrap_or("None"));
+        builder.zen_package.summary.name = builder.zen_package.name_map.store_exact(builder.source_package_name.as_deref().unwrap_or("None"));
     }
 
     Ok(builder)

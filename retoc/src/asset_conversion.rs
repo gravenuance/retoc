@@ -742,8 +742,9 @@ fn build_export_map(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
         let template_index = resolve_local_package_object(builder, zen_export.template_index)?;
         let outer_index = resolve_local_package_object(builder, zen_export.outer_index)?;
 
-        let export_name_string = builder.zen_package.name_map.get(zen_export.object_name).to_string();
-        let object_name = builder.legacy_package.name_map.store(&export_name_string);
+        let (export_name_base, export_name_number) = builder.zen_package.name_map.get_parts(zen_export.object_name);
+        let (export_name_base, export_name_number) = (export_name_base.to_string(), export_name_number);
+        let object_name = builder.legacy_package.name_map.store_parts(&export_name_base, export_name_number);
         let object_flags = zen_export.object_flags;
 
         // Zen's serial offset is relative to the start of export data, which is at HeaderSize
@@ -822,8 +823,9 @@ fn build_export_map(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
         for cell_export_index in 0..builder.zen_package.cell_export_map.len() {
             let zen_cell_export: FCellExportMapEntry = builder.zen_package.as_ref().cell_export_map[cell_export_index].clone();
 
-            let cpp_class_info_string = builder.zen_package.name_map.get(zen_cell_export.cpp_class_info).to_string();
-            let cpp_class_info = builder.legacy_package.name_map.store(&cpp_class_info_string);
+            let (cpp_class_info_base, cpp_class_info_number) = builder.zen_package.name_map.get_parts(zen_cell_export.cpp_class_info);
+            let (cpp_class_info_base, cpp_class_info_number) = (cpp_class_info_base.to_string(), cpp_class_info_number);
+            let cpp_class_info = builder.legacy_package.name_map.store_parts(&cpp_class_info_base, cpp_class_info_number);
 
             let verse_path = if zen_cell_export.public_export_hash != 0 {
                 Utf8String(
