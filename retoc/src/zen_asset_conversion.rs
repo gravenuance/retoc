@@ -700,7 +700,11 @@ fn build_zen_dependency_bundle_new(builder: &mut ZenPackageBuilder, export_load_
                         local_import_or_export_index: from_dependency_node.package_index,
                     });
                 }
-                // Otherwise, if this is an import, we only add it if it's a package export import
+                // Otherwise, if this is an import, add it as long as it actually resolved to something -
+                // a real cooked package can depend on a ScriptImport (e.g. a native class or its CDO)
+                // just as validly as a PackageImport, confirmed against a real cooked package whose
+                // dependency bundle includes exactly such entries. Excluding anything but PackageImport
+                // here silently dropped those real dependencies.
                 else if from_dependency_node.package_index.is_import() {
                     // Note that we are working with "extended" package indices here, where raw import index could refer either to normal import or to cell import
                     // We need to handle both here separately since both of them are relevant for dependency sorting
@@ -711,7 +715,7 @@ fn build_zen_dependency_bundle_new(builder: &mut ZenPackageBuilder, export_load_
                         immut_builder.zen_package.cell_import_map[raw_import_index - immut_builder.zen_package.import_map.len()]
                     };
 
-                    if zen_import_package_index.kind() == FPackageObjectIndexType::PackageImport {
+                    if zen_import_package_index.kind() != FPackageObjectIndexType::Null {
                         result_dependencies.push(FDependencyBundleEntry {
                             local_import_or_export_index: from_dependency_node.package_index,
                         });
