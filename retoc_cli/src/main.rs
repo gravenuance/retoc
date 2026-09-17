@@ -937,19 +937,23 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
     // create empty pak file if one does not already exist (necessary for game to detect and load container)
     let pak_path = Path::new(&args.output).with_extension("pak");
     if !pak_path.exists() {
-        // Marvel Rivals expects an AES-encrypted stub and rejects the standard V11 format for
-        // it specifically (V8B is what actually loads); other games may need neither. Reuse
-        // whatever key was already supplied via --aes-key for the zero GUID, since that's the
-        // slot Marvel Rivals registers its own key against, and treat its presence as "target
-        // Marvel Rivals" - there's no other reason this CLI would have that key configured.
+        // Real Marvel Rivals companion stubs are V11 AND AES-encrypted with the same key used
+        // for IoStore content - confirmed against `natimerry/retoc-rivals` (a purpose-built,
+        // community-maintained fork whose `write_companion_pak` does exactly this: V11, real
+        // key, real path_hash_seed). An earlier attempt to manually decrypt a real stub's index
+        // with this key appeared to fail, which led to a wrong "must be a different, unknown
+        // key" conclusion and an unencrypted-stub workaround - that workaround avoided the
+        // "Corrupt pak index" crash but produced something the game doesn't treat as an active
+        // mod (confirmed empirically: swapping either half of a working real mod's pak/utoc
+        // pair for our own, in either direction, broke it - only real+real or (once this is
+        // right) ours+ours should work). The manual-decrypt failure was a methodology bug, not
+        // a real second key.
         let mut pak_builder = repak::PakBuilder::new();
-        let mut pak_version = repak::Version::V11;
         if let Some(aes_key) = config.aes_keys.get(&FGuid::default()) {
             pak_builder = pak_builder.key(aes_key.cipher().clone()).variant(repak::PakVariant::MarvelRivals);
-            pak_version = repak::Version::V8B;
         }
         pak_builder
-            .writer(&mut BufWriter::new(fs::File::create(pak_path)?), pak_version, mount_point.to_string(), None)
+            .writer(&mut BufWriter::new(fs::File::create(pak_path)?), repak::Version::V11, mount_point.to_string(), Some(0))
             .write_index()?;
     }
 
