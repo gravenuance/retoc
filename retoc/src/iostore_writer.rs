@@ -1,6 +1,7 @@
 use crate::{
     EIoChunkType, FPackageId, UEPath, UEPathBuf, align_usize,
     chunk_id::FIoChunkIdRaw,
+    compression::{CompressionMethod, compress},
     container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry},
 };
 use crate::{EIoStoreTocVersion, FIoChunkHash, FIoChunkId, FIoContainerId, FIoOffsetAndLength, FIoStoreTocCompressedBlockEntry, FIoStoreTocEntryMeta, FIoStoreTocEntryMetaFlags, Toc, ser::*};
@@ -29,7 +30,9 @@ impl IoStoreWriter {
         let cas_stream = BufWriter::new(fs::File::create(toc_path.with_extension("ucas"))?);
 
         let mut toc = Toc::new();
-        toc.compression_block_size = 0x10000;
+        // Real containers (both the base game's own and working third-party mods) use 128KiB
+        // blocks - confirmed by diffing a real container's TOC header against ours byte-for-byte.
+        toc.compression_block_size = 0x20000;
         toc.version = toc_version;
         toc.container_id = FIoContainerId::from_name(&name);
         toc.directory_index.mount_point = mount_point;
@@ -55,24 +58,42 @@ impl IoStoreWriter {
             index.add_file(relative_path, self.toc.chunks.len() as u32);
         }
 
+        if self.toc.compression_methods.is_empty() {
+            self.toc.compression_methods.push(CompressionMethod::Oodle);
+        }
+
         let mut offset = self.cas_stream.stream_position()?;
 
         let start_block = self.toc.compression_blocks.len();
 
         let mut hasher = blake3::Hasher::new();
+        let mut any_block_compressed = false;
+        let mut compress_buf = Vec::new();
         for block in data.chunks(self.toc.compression_block_size as usize) {
-            self.cas_stream.write_all(block)?;
             hasher.update(block);
-            let compressed_size = block.len() as u32;
             let uncompressed_size = block.len() as u32;
-            let compression_method_index = 0; // "None"
+
+            compress_buf.clear();
+            let (bytes_to_write, compression_method_index) = if compress(CompressionMethod::Oodle, block, &mut compress_buf).is_ok() && compress_buf.len() < block.len() {
+                any_block_compressed = true;
+                (compress_buf.as_slice(), 1u8) // index into toc.compression_methods (1-based; 0 is "None")
+            } else {
+                (block, 0u8)
+            };
+
+            self.cas_stream.write_all(bytes_to_write)?;
+            let compressed_size = bytes_to_write.len() as u32;
             self.toc.compression_blocks.push(FIoStoreTocCompressedBlockEntry::new(offset, compressed_size, uncompressed_size, compression_method_index));
             offset += compressed_size as u64;
         }
         let hash = hasher.finalize();
+        let mut flags = FIoStoreTocEntryMetaFlags::empty();
+        if any_block_compressed {
+            flags |= FIoStoreTocEntryMetaFlags::Compressed;
+        }
         let meta = FIoStoreTocEntryMeta {
             chunk_hash: FIoChunkHash::from_blake3(hash.as_bytes()),
-            flags: FIoStoreTocEntryMetaFlags::empty(),
+            flags,
         };
 
         let offset_and_length = FIoOffsetAndLength::new(start_block as u64 * self.toc.compression_block_size as u64, data.len() as u64);
