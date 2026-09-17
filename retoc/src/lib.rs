@@ -66,7 +66,7 @@ pub struct ParallelPakWriter {
 }
 impl FileWriterTrait for ParallelPakWriter {
     fn write_file(&self, path: String, allow_compress: bool, data: Vec<u8>) -> Result<()> {
-        let entry = self.entry_builder.build_entry(allow_compress, data)?;
+        let entry = self.entry_builder.build_entry(allow_compress, &path, data)?;
         self.tx.send((path, entry))?;
         Ok(())
     }
@@ -189,6 +189,11 @@ pub struct Config {
 
 #[derive(Debug, Clone)]
 pub struct AesKey(aes::Aes256);
+impl AesKey {
+    pub fn cipher(&self) -> &aes::Aes256 {
+        &self.0
+    }
+}
 impl std::str::FromStr for AesKey {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
