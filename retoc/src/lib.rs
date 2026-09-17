@@ -530,6 +530,9 @@ impl Writeable for Toc {
         let mut container_flags = EIoContainerFlags::empty();
 
         container_flags |= EIoContainerFlags::Indexed;
+        if !self.compression_methods.is_empty() {
+            container_flags |= EIoContainerFlags::Compressed;
+        }
         let mut directory_index_buffer = vec![];
         self.directory_index.ser(&mut Cursor::new(&mut directory_index_buffer))?;
         // TODO encrypt directory index
