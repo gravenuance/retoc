@@ -1041,9 +1041,9 @@ impl FIoStoreTocCompressedBlockEntry {
 pub struct FIoChunkHash(pub [u8; 32]);
 impl FIoChunkHash {
     pub fn from_blake3(hash: &[u8; 32]) -> FIoChunkHash {
-        let mut data = [0; 32];
-        data[0..20].copy_from_slice(&hash[0..20]);
-        Self(data)
+        // Real containers use the full, untruncated blake3 digest - confirmed by hashing a real
+        // chunk's plaintext and comparing all 32 bytes against the container's stored hash.
+        Self(*hash)
     }
 }
 impl std::fmt::Debug for FIoChunkHash {
