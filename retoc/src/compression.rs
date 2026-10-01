@@ -15,7 +15,12 @@ impl CompressionMethod {
     }
 }
 
-pub fn compress<S: Write>(compression: CompressionMethod, input: &[u8], mut output: S) -> Result<()> {
+pub fn compress<S: Write>(compression: CompressionMethod, input: &[u8], output: S) -> Result<()> {
+    compress_with_oodle_compressor(compression, oodle_loader::Compressor::Mermaid, input, output)
+}
+
+/// Like `compress`, with the Oodle compressor chosen by the caller (it only affects the Oodle method).
+pub fn compress_with_oodle_compressor<S: Write>(compression: CompressionMethod, oodle_compressor: oodle_loader::Compressor, input: &[u8], mut output: S) -> Result<()> {
     match compression {
         CompressionMethod::Zlib => {
             let mut encoder = flate2::write::ZlibEncoder::new(output, flate2::Compression::best());
@@ -31,7 +36,7 @@ pub fn compress<S: Write>(compression: CompressionMethod, input: &[u8], mut outp
             output.write_all(&buf)?;
         }
         CompressionMethod::Oodle => {
-            let buffer = oodle_loader::oodle()?.compress(input, oodle_loader::Compressor::Mermaid, oodle_loader::CompressionLevel::Normal)?;
+            let buffer = oodle_loader::oodle()?.compress(input, oodle_compressor, oodle_loader::CompressionLevel::Normal)?;
             output.write_all(&buffer)?;
         }
     }

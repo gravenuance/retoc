@@ -341,19 +341,45 @@ fn read_chunk_block_signatures<R: Read>(stream: &mut R, header: &FIoStoreTocHead
 }
 
 #[instrument(skip_all)]
-fn read_directory_index<R: Read>(stream: &mut R, header: &FIoStoreTocHeader, config: &Config) -> Result<Vec<u8>> {
+fn read_directory_index<R: Read>(stream: &mut R, header: &FIoStoreTocHeader, config: &Config) -> Result<FIoDirectoryIndexResource> {
     let mut buf: Vec<u8> = stream.de_ctx(header.directory_index_size as usize)?;
+    if buf.is_empty() {
+        return Ok(FIoDirectoryIndexResource::default());
+    }
 
     if header.container_flags.contains(EIoContainerFlags::Encrypted) {
         use aes::cipher::BlockDecrypt;
 
+        // retoc-rivals --obfuscate sets Encrypted but writes the index in plaintext. Checked before parsing, since the
+        // parser trusts its length fields and decrypted plaintext would hand it random ones.
+        if looks_like_plaintext_index(&buf) {
+            eprintln!("Directory index of encrypted container is stored unencrypted; reading it as plaintext");
+            return FIoDirectoryIndexResource::de(&mut Cursor::new(buf));
+        }
         let key = config.aes_keys.get(&header.encryption_key_guid).context("missing encryption key")?;
+        anyhow::ensure!(buf.len().is_multiple_of(16), "encrypted directory index is not AES-block-aligned ({} bytes)", buf.len());
         for block in buf.chunks_mut(16) {
             key.0.decrypt_block(block.into());
         }
     }
 
-    Ok(buf)
+    FIoDirectoryIndexResource::de(&mut Cursor::new(buf))
+}
+
+/// True when `buf` starts the way an unencrypted directory index does: an FString mount point (one byte per character
+/// for a positive length, UTF-16 for a negative one) of printable ASCII that fits in the buffer and ends in its NUL.
+fn looks_like_plaintext_index(buf: &[u8]) -> bool {
+    let Some(len) = buf.get(..4).and_then(|bytes| bytes.try_into().ok()).map(i32::from_le_bytes) else {
+        return false;
+    };
+    let char_size = if len > 0 { 1 } else { 2 };
+    let text_len = (len.unsigned_abs() as usize).checked_mul(char_size);
+    let Some(text) = text_len.filter(|&n| n > 0).and_then(|n| buf.get(4..4usize.checked_add(n)?)) else {
+        return false;
+    };
+    let (chars, terminator) = text.split_at(text.len() - char_size);
+    let is_printable = |c: &[u8]| (0x20..0x7f).contains(&c[0]) && c[1..].iter().all(|&b| b == 0);
+    terminator.iter().all(|&b| b == 0) && chars.chunks(char_size).all(is_printable)
 }
 
 #[instrument(skip_all)]
@@ -488,7 +514,6 @@ impl ReadableCtx<Arc<Config>> for Toc {
         let mut file_map: HashMap<String, u32> = Default::default();
         let mut file_map_lower: HashMap<String, u32> = Default::default();
         let mut file_map_rev: HashMap<u32, String> = Default::default();
-        let directory_index = if !directory_index.is_empty() { FIoDirectoryIndexResource::de(&mut Cursor::new(directory_index))? } else { FIoDirectoryIndexResource::default() };
         directory_index.iter_root(|user_data, path| {
             let path = path.join("/");
             file_map_lower.insert(path.to_ascii_lowercase(), user_data);
@@ -527,7 +552,8 @@ impl ReadableCtx<Arc<Config>> for Toc {
 }
 impl Writeable for Toc {
     fn ser<S: Write>(&self, s: &mut S) -> Result<()> {
-        let mut container_flags = EIoContainerFlags::empty();
+        // Flags the writer chose (e.g. Encrypted) are kept
+        let mut container_flags = EIoContainerFlags::from_bits_retain(self.container_flags.bits());
 
         container_flags |= EIoContainerFlags::Indexed;
         if !self.compression_methods.is_empty() {
@@ -552,7 +578,7 @@ impl Writeable for Toc {
             directory_index_size: directory_index_buffer.len() as u32,
             partition_count: 1,
             container_id: self.container_id,
-            encryption_key_guid: Default::default(),
+            encryption_key_guid: self.encryption_key_guid,
             container_flags,
             reserved3: 0,
             reserved4: 0,
