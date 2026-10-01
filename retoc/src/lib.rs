@@ -5,6 +5,7 @@ pub mod compression;
 pub mod container_header;
 pub mod crc;
 pub mod file_pool;
+pub mod game;
 pub mod iostore;
 pub mod iostore_writer;
 pub mod legacy_asset;

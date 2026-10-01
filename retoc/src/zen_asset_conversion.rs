@@ -1,4 +1,5 @@
 use crate::container_header::{EIoContainerHeaderVersion, StoreEntry};
+use crate::game::{GameVariant, ZenConversionRules};
 use crate::iostore_writer::IoStoreWriter;
 use crate::legacy_asset::{EPackageFlags, FLegacyPackageFileSummary, FLegacyPackageHeader, FSerializedAssetBundle, convert_localized_package_name_to_source, get_package_object_full_name};
 use crate::logging::Log;
@@ -11,7 +12,7 @@ use crate::zen::{
     FPackageFileVersion, FPackageIndex, FZenPackageHeader, FZenPackageVersioningInfo, ZenScriptCellsStore,
 };
 use crate::{EIoChunkType, FIoChunkId, FPackageId, FSHAHash, UEPath, UEPathBuf};
-use crate::{debug, warning};
+use crate::{debug, verbose, warning};
 use anyhow::{Context, anyhow, bail};
 use byteorder::{LE, ReadBytesExt};
 use std::cmp::{Ordering, max};
@@ -68,9 +69,14 @@ struct ZenPackageBuilder<'a> {
     // full names of package objects by their index, useful for debugging
     debug_full_package_object_names: HashMap<FPackageIndex, String>,
     log: &'a Log,
+    // game-specific conversion (see crate::game); patched_exports replaces the legacy exports when set
+    game: GameVariant,
+    rules: ZenConversionRules,
+    patched_exports: Option<Vec<u8>>,
 }
 
 // Flow is create_asset_builder -> setup_zen_package_summary -> build_zen_import_map -> build_zen_export_map -> build_zen_preload_dependencies -> serialize_zen_asset
+#[allow(clippy::too_many_arguments)]
 fn create_asset_builder<'a>(
     package: FLegacyPackageHeader,
     container_header_version: EIoContainerHeaderVersion,
@@ -79,6 +85,7 @@ fn create_asset_builder<'a>(
     script_objects: Option<Arc<ZenScriptObjects>>,
     script_cells: Option<Arc<ZenScriptCellsStore>>,
     log: &'a Log,
+    game: GameVariant,
 ) -> ZenPackageBuilder<'a> {
     let package_name = source_package_name.as_deref().unwrap_or(&package.summary.package_name).to_string();
     ZenPackageBuilder {
@@ -103,6 +110,9 @@ fn create_asset_builder<'a>(
         script_objects,
         script_cells,
         log,
+        game,
+        rules: game.zen_conversion_rules(),
+        patched_exports: None,
     }
 }
 
@@ -147,6 +157,9 @@ fn setup_zen_package_summary(builder: &mut ZenPackageBuilder) -> anyhow::Result<
     // Set package name on the zen package from the legacy package header
     // (deferred to match name map order of editor)
     // builder.zen_package.summary.name = builder.zen_package.name_map.store(&builder.legacy_package.summary.package_name);
+    if !builder.rules.package_name_stored_last {
+        builder.zen_package.summary.name = builder.zen_package.name_map.store(&builder.legacy_package.summary.package_name);
+    }
     // Copy size of the cooked header from the legacy package
     builder.zen_package.summary.cooked_header_size = builder.legacy_package.summary.versioning_info.total_header_size as u32;
 
@@ -222,6 +235,11 @@ fn resolve_legacy_package_object(package: &ZenPackageBuilder, object_index: FPac
 
 fn convert_legacy_import_to_object_index(builder: &mut ZenPackageBuilder, import_index: usize) -> anyhow::Result<FPackageObjectIndex> {
     let (package_name, full_import_name) = resolve_legacy_package_object(builder, FPackageIndex::create_import(import_index as u32))?;
+
+    if let Some(script_path) = builder.game.remap_import(&package_name, &full_import_name) {
+        verbose!(builder.log, "Remapped import {import_index} of {}: {full_import_name} -> {script_path}", &builder.package_name);
+        return Ok(FPackageObjectIndex::create_script_import(script_path));
+    }
 
     // If this is a script import, just resolve it directly using the full import name as an index into script objects
     let is_script_import = package_name.starts_with("/Script/");
@@ -324,7 +342,7 @@ fn build_zen_import_map(builder: &mut ZenPackageBuilder) -> anyhow::Result<()> {
         builder.zen_package.cell_import_map.push(import_object_index);
     }
 
-    if builder.container_header_version > EIoContainerHeaderVersion::Initial {
+    if builder.container_header_version > EIoContainerHeaderVersion::Initial && builder.rules.sort_imported_packages {
         // Sort imports by package ID and rebuild maps pointing to sorted index
         // Create a sorted list of (old_index, package_id, package_name)
         let mut sorted_packages: Vec<(usize, FPackageId, String)> = builder
@@ -410,7 +428,11 @@ fn build_zen_export_map(builder: &mut ZenPackageBuilder) -> anyhow::Result<()> {
             // Zen cooked serial offset does not include header size, but legacy asset one does
             cooked_serial_offset -= total_header_size;
         }
-        let mapped_object_name = builder.zen_package.name_map.store_parts(&object_name_base, object_name_number);
+        let mapped_object_name = if builder.rules.exact_names {
+            builder.zen_package.name_map.store_parts(&object_name_base, object_name_number)
+        } else {
+            builder.zen_package.name_map.store(&builder.legacy_package.name_map.get(object_export.object_name)?)
+        };
 
         let outer_index = remap_package_index_reference(builder, object_export.outer_index);
         let class_index = remap_package_index_reference(builder, object_export.class_index);
@@ -693,7 +715,8 @@ fn build_zen_dependency_bundle_new(builder: &mut ZenPackageBuilder, export_load_
 
         for from_dependency_node in export_dependencies.get(to_dependency_node).unwrap_or(&Vec::new()) {
             // Skip nodes that do not have the matching command type, and skip exact self-references (same export, same command type)
-            if from_dependency_node.command_type == from_command_type && !(from_dependency_node.package_index == to_dependency_node.package_index && from_dependency_node.command_type == to_dependency_node.command_type) {
+            let is_self_reference = from_dependency_node.package_index == to_dependency_node.package_index && (!immut_builder.rules.exact_self_dependencies || from_dependency_node.command_type == to_dependency_node.command_type);
+            if from_dependency_node.command_type == from_command_type && !is_self_reference {
                 // If this is an export, add the dependency bundle entry at all times
                 if from_dependency_node.package_index.is_export() {
                     result_dependencies.push(FDependencyBundleEntry {
@@ -715,7 +738,12 @@ fn build_zen_dependency_bundle_new(builder: &mut ZenPackageBuilder, export_load_
                         immut_builder.zen_package.cell_import_map[raw_import_index - immut_builder.zen_package.import_map.len()]
                     };
 
-                    if zen_import_package_index.kind() != FPackageObjectIndexType::Null {
+                    let is_kept_import = if immut_builder.rules.script_import_dependencies {
+                        zen_import_package_index.kind() != FPackageObjectIndexType::Null
+                    } else {
+                        zen_import_package_index.kind() == FPackageObjectIndexType::PackageImport
+                    };
+                    if is_kept_import {
                         result_dependencies.push(FDependencyBundleEntry {
                             local_import_or_export_index: from_dependency_node.package_index,
                         });
@@ -894,6 +922,10 @@ fn build_zen_preload_dependencies(builder: &mut ZenPackageBuilder) -> anyhow::Re
         let mut create_dependencies: Vec<ZenDependencyGraphNode> = Vec::new();
         let mut serialize_dependencies: Vec<ZenDependencyGraphNode> = Vec::new();
 
+        if !builder.rules.exact_self_dependencies {
+            serialize_dependencies.push(create_graph_node);
+        }
+
         // Collect create and serialize dependencies for this export
         if object_export.first_export_dependency_index != -1 {
             // Create before create dependencies. They go first because Package Store Optimizer puts them first
@@ -951,7 +983,7 @@ fn build_zen_preload_dependencies(builder: &mut ZenPackageBuilder) -> anyhow::Re
         export_graph_nodes.push(ZenExportGraphNode { node: create_graph_node, is_public_export });
         export_graph_nodes.push(ZenExportGraphNode { node: serialize_graph_node, is_public_export });
 
-        if builder.container_header_version < EIoContainerHeaderVersion::NoExportInfo {
+        if builder.rules.exact_self_dependencies && builder.container_header_version < EIoContainerHeaderVersion::NoExportInfo {
             //This export's serialize has a dependency on this export's create. This dependency is added first because it is added before anything else by the Package Store Optimizer
             serialize_dependencies.push(create_graph_node);
         }
@@ -1116,13 +1148,14 @@ fn serialize_zen_asset(builder: &ZenPackageBuilder, legacy_asset_bundle: &FSeria
 
     // Serialize package header
     let legacy_external_arcs_serialized_offsets = FZenPackageHeader::serialize(&builder.zen_package, &mut result_package_writer, &mut result_store_entry, builder.container_header_version)?;
+    let exports_file_buffer = builder.patched_exports.as_deref().unwrap_or(&legacy_asset_bundle.exports_file_buffer);
 
     if builder.container_header_version >= EIoContainerHeaderVersion::NoExportInfo {
         // Write export buffer without any changes if we are following cooked offsets
-        result_package_writer.write_all(&legacy_asset_bundle.exports_file_buffer)?;
+        result_package_writer.write_all(exports_file_buffer)?;
     } else {
         // Write export buffer in bundle order otherwise, moving exports around to follow bundle serialization order
-        write_exports_in_bundle_order(&mut result_package_writer, builder, &legacy_asset_bundle.exports_file_buffer)?;
+        write_exports_in_bundle_order(&mut result_package_writer, builder, exports_file_buffer)?;
     }
     Ok((result_store_entry, result_package_buffer, legacy_external_arcs_serialized_offsets))
 }
@@ -1298,24 +1331,26 @@ fn build_zen_asset_internal<'a>(
     script_objects: Option<Arc<ZenScriptObjects>>,
     script_cells: Option<Arc<ZenScriptCellsStore>>,
     log: &'a Log,
+    game: GameVariant,
 ) -> anyhow::Result<ZenPackageBuilder<'a>> {
     // Read legacy package header
     let mut asset_header_reader = Cursor::new(&legacy_asset.asset_file_buffer);
     let legacy_package_header = FLegacyPackageHeader::deserialize(&mut asset_header_reader, package_version_fallback)?;
 
     // Construct zen asset from the package header
-    let mut builder = create_asset_builder(legacy_package_header, container_header_version, fixup_legacy_external_arcs, source_package_name, script_objects, script_cells, log);
+    let mut builder = create_asset_builder(legacy_package_header, container_header_version, fixup_legacy_external_arcs, source_package_name, script_objects, script_cells, log, game);
 
     // Build zen asset data
     setup_zen_package_summary(&mut builder)?;
+    builder.patched_exports = game.patch_legacy_package(&mut builder.legacy_package, &legacy_asset.exports_file_buffer, legacy_asset.bulk_data_buffer.as_deref(), &mut builder.zen_package.bulk_data, log);
     build_zen_import_map(&mut builder)?;
     build_zen_export_map(&mut builder)?;
     build_zen_preload_dependencies(&mut builder)?;
 
     // Finally store and set package summary name
-    if builder.container_header_version > EIoContainerHeaderVersion::Initial {
+    if builder.rules.package_name_stored_last && builder.container_header_version > EIoContainerHeaderVersion::Initial {
         builder.zen_package.summary.name = builder.zen_package.name_map.store_exact(&builder.legacy_package.summary.package_name);
-    } else {
+    } else if builder.rules.package_name_stored_last {
         builder.zen_package.summary.name = builder.zen_package.name_map.store_exact(builder.source_package_name.as_deref().unwrap_or("None"));
     }
 
@@ -1333,6 +1368,7 @@ pub fn build_zen_asset(
     script_objects: Option<Arc<ZenScriptObjects>>,
     script_cells: Option<Arc<ZenScriptCellsStore>>,
     log: &Log,
+    game: GameVariant,
 ) -> anyhow::Result<ConvertedZenAssetBundle> {
     let source_package_name = if container_header_version <= EIoContainerHeaderVersion::Initial {
         let stripped = path.strip_prefix("../../../").unwrap();
@@ -1345,7 +1381,7 @@ pub fn build_zen_asset(
 
     // We want to fixup this asset once we have converted all the packages
     let final_allow_fixup = container_header_version <= EIoContainerHeaderVersion::Initial && allow_fixup;
-    let builder = build_zen_asset_internal(&legacy_asset, container_header_version, package_version_fallback, final_allow_fixup, source_package_name, script_objects, script_cells, log)?;
+    let builder = build_zen_asset_internal(&legacy_asset, container_header_version, package_version_fallback, final_allow_fixup, source_package_name, script_objects, script_cells, log, game)?;
 
     // Serialize the resulting asset into the container writer
     build_converted_zen_asset(&builder, legacy_asset, path, package_name_to_referenced_shader_maps)
@@ -1362,7 +1398,7 @@ mod test {
     pub fn build_serialize_zen_asset(legacy_asset: &FSerializedAssetBundle, container_header_version: EIoContainerHeaderVersion, package_version_fallback: Option<FPackageFileVersion>, source_package_name: Option<String>) -> anyhow::Result<(FPackageId, StoreEntry, Vec<u8>)> {
         // Do not allow legacy external arc fixup, just emit the asset that does not require fixup immediately using only the information available from this asset
         let logger = Log::no_log();
-        let builder = build_zen_asset_internal(legacy_asset, container_header_version, package_version_fallback, false, source_package_name, None, None, &logger)?;
+        let builder = build_zen_asset_internal(legacy_asset, container_header_version, package_version_fallback, false, source_package_name, None, None, &logger, GameVariant::Standard)?;
 
         let (store_entry, package_data, _) = serialize_zen_asset(&builder, legacy_asset)?;
         Ok((builder.package_id, store_entry, package_data))
@@ -1568,6 +1604,141 @@ mod test {
         );
 
         // assert_eq!(original_zen_asset, converted_zen_asset, "Original and converted asset binary equality check failed");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod game_variant_test {
+    use super::*;
+    use crate::version::EngineVersion;
+    use fs_err as fs;
+
+    fn read_bundle(name: &str) -> anyhow::Result<FSerializedAssetBundle> {
+        Ok(FSerializedAssetBundle {
+            asset_file_buffer: fs::read(format!("tests/UE5.5/{name}.uasset"))?,
+            exports_file_buffer: fs::read(format!("tests/UE5.5/{name}.uexp"))?,
+            bulk_data_buffer: None,
+            optional_bulk_data_buffer: None,
+            memory_mapped_bulk_data_buffer: None,
+        })
+    }
+
+    fn convert(name: &str, game: GameVariant) -> anyhow::Result<FZenPackageHeader> {
+        let version = EngineVersion::UE5_5;
+        let log = Log::no_log();
+        let builder = build_zen_asset_internal(&read_bundle(name)?, version.container_header_version(), Some(version.package_file_version()), false, None, None, None, &log, game)?;
+        Ok(builder.zen_package)
+    }
+
+    #[test]
+    fn standard_output_is_unchanged() -> anyhow::Result<()> {
+        // blake3 of the serialized package as converted at 8c47bd5, before game variants existed
+        for (name, expected) in [
+            ("SM_Cube", "e0e34df0a34ae83f283a324a049d7e82e1bf35b4e06b5f056c76c24e6afd6013"),
+            ("T_Test", "22d11527191983999992505439c0db639552d503b3554ce0ef1c3897fcbf128d"),
+            ("BP_ThirdPersonCharacter", "817019d7a517569c6e30cccea818b03f051471d06f4e12b2ac405fa232fe3b1f"),
+        ] {
+            let version = EngineVersion::UE5_5;
+            let bundle = read_bundle(name)?;
+            let log = Log::no_log();
+            let builder = build_zen_asset_internal(&bundle, version.container_header_version(), Some(version.package_file_version()), false, None, None, None, &log, GameVariant::Standard)?;
+            let (_, bytes, _) = serialize_zen_asset(&builder, &bundle)?;
+            assert_eq!(blake3::hash(&bytes).to_hex().as_str(), expected, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rivals_keeps_imported_packages_in_first_use_order() -> anyhow::Result<()> {
+        // SM_Cube's material slots import M_Cube_1 before M_Cube_2; sorting by package ID reverses them
+        assert_eq!(convert("SM_Cube", GameVariant::Standard)?.imported_package_names, ["/Game/Meshes/M_Cube_2", "/Game/Meshes/M_Cube_1"]);
+        assert_eq!(convert("SM_Cube", GameVariant::MarvelRivals)?.imported_package_names, ["/Game/Meshes/M_Cube_1", "/Game/Meshes/M_Cube_2"]);
+        Ok(())
+    }
+
+    #[test]
+    fn rivals_dependency_bundles_drop_script_imports_and_self_dependencies() -> anyhow::Result<()> {
+        // T_Test's only dependencies are its two script imports and serialize-on-create for its own export
+        assert_eq!(convert("T_Test", GameVariant::Standard)?.dependency_bundle_entries.len(), 2);
+        assert_eq!(convert("T_Test", GameVariant::MarvelRivals)?.dependency_bundle_entries.len(), 0);
+
+        let rivals = convert("SM_Cube", GameVariant::MarvelRivals)?;
+        for entry in rivals.dependency_bundle_entries.iter().filter(|e| e.local_import_or_export_index.is_import()) {
+            assert_eq!(rivals.import_map[entry.local_import_or_export_index.to_import_index() as usize].kind(), FPackageObjectIndexType::PackageImport);
+        }
+        Ok(())
+    }
+
+    /// Runs the conversion steps on a header the test has adjusted, with the UE 5.3 container header Rivals uses.
+    fn convert_header(name: &str, game: GameVariant, adjust: impl Fn(&mut FLegacyPackageHeader)) -> anyhow::Result<FZenPackageHeader> {
+        let log = Log::no_log();
+        let bundle = read_bundle(name)?;
+        let mut header = FLegacyPackageHeader::deserialize(&mut Cursor::new(&bundle.asset_file_buffer), Some(EngineVersion::UE5_5.package_file_version()))?;
+        adjust(&mut header);
+        let mut builder = create_asset_builder(header, EngineVersion::UE5_3.container_header_version(), false, None, None, None, &log, game);
+        setup_zen_package_summary(&mut builder)?;
+        build_zen_import_map(&mut builder)?;
+        build_zen_export_map(&mut builder)?;
+        build_zen_preload_dependencies(&mut builder)?;
+        Ok(builder.zen_package)
+    }
+
+    #[test]
+    fn rivals_reformats_export_names_with_a_numeric_suffix() -> anyhow::Result<()> {
+        // A costume-style name stored whole (number 0) in the legacy name map, like SK_1033_1033001
+        let rename = |header: &mut FLegacyPackageHeader| header.exports[0].object_name = header.name_map.store_parts("SM_Cube_1033001", 0);
+
+        let standard = convert_header("SM_Cube", GameVariant::Standard, rename)?;
+        assert_eq!(standard.name_map.get_parts(standard.export_map[0].object_name), ("SM_Cube_1033001", 0));
+        let rivals = convert_header("SM_Cube", GameVariant::MarvelRivals, rename)?;
+        assert_eq!(rivals.name_map.get_parts(rivals.export_map[0].object_name), ("SM_Cube", 1_033_002));
+        Ok(())
+    }
+
+    #[test]
+    fn rivals_drops_an_exports_dependency_on_its_own_create() -> anyhow::Result<()> {
+        // Dependency bundle entries of each export that point back at that same export
+        let self_entries = |package: &FZenPackageHeader| -> usize {
+            package
+                .dependency_bundle_headers
+                .iter()
+                .enumerate()
+                .map(|(export_index, header)| {
+                    let count = (header.create_before_create_dependencies + header.serialize_before_create_dependencies + header.create_before_serialize_dependencies + header.serialize_before_serialize_dependencies) as usize;
+                    let first = header.first_entry_index as usize;
+                    package.dependency_bundle_entries[first..first + count].iter().filter(|e| e.local_import_or_export_index == FPackageIndex::create_export(export_index as u32)).count()
+                })
+                .sum()
+        };
+
+        // BP_ThirdPersonCharacter's component exports serialize after their own create
+        assert!(self_entries(&convert_header("BP_ThirdPersonCharacter", GameVariant::Standard, |_| {})?) > 0);
+        assert_eq!(self_entries(&convert_header("BP_ThirdPersonCharacter", GameVariant::MarvelRivals, |_| {})?), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rivals_splits_the_package_name_during_summary_setup() -> anyhow::Result<()> {
+        let version = EngineVersion::UE5_5;
+        let log = Log::no_log();
+        let setup = |game: GameVariant| -> anyhow::Result<FZenPackageHeader> {
+            let bundle = read_bundle("SM_Cube")?;
+            let mut header = FLegacyPackageHeader::deserialize(&mut Cursor::new(&bundle.asset_file_buffer), Some(version.package_file_version()))?;
+            // A name whose last segment is a costume ID, like SK_1033_1033001
+            header.summary.package_name = "/Game/Meshes/SM_Cube_1033001".to_string();
+            let mut builder = create_asset_builder(header, version.container_header_version(), false, None, None, None, &log, game);
+            setup_zen_package_summary(&mut builder)?;
+            Ok(builder.zen_package)
+        };
+
+        let rivals = setup(GameVariant::MarvelRivals)?;
+        assert_eq!(rivals.name_map.get_parts(rivals.summary.name), ("/Game/Meshes/SM_Cube", 1_033_002));
+        // Stored right after the names referenced from export data, before export names are added
+        assert_eq!(rivals.name_map.copy_raw_names(), ["BlockAll", "Chaos", "MatB", "Material", "NavCollision_Chaos", "/Game/Meshes/SM_Cube"]);
+
+        let standard = setup(GameVariant::Standard)?;
+        assert_eq!(standard.summary.name, FZenPackageHeader::default().summary.name, "standard stores the name after all other names");
         Ok(())
     }
 }

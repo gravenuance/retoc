@@ -4,7 +4,9 @@ use clap::Parser;
 use fs_err as fs;
 use rayon::prelude::*;
 use retoc::asset_conversion::{self, FZenPackageContext};
+use retoc::compression::CompressionMethod;
 use retoc::container_header::EIoContainerHeaderVersion;
+use retoc::game::{GameVariant, marvel_rivals};
 use retoc::iostore::{IoStoreTrait, PackageInfo};
 use retoc::iostore_writer::IoStoreWriter;
 use retoc::legacy_asset::FSerializedAssetBundle;
@@ -172,6 +174,13 @@ struct ActionToZen {
     #[arg(long)]
     script_cell: Vec<VerseScriptCell>,
 
+    /// Block compression [default: oodle]
+    #[arg(long)]
+    compression: Option<CompressionArg>,
+    /// Encrypt the container's data blocks with the AES key (--game rivals only; the directory index stays plaintext, as retoc-rivals writes it)
+    #[arg(long)]
+    obfuscate: bool,
+
     /// Verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -181,6 +190,26 @@ struct ActionToZen {
     /// Do not run in parallel. Useful for debugging
     #[arg(long)]
     no_parallel: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum CompressionArg {
+    None,
+    Zlib,
+    Zstd,
+    Lz4,
+    Oodle,
+}
+impl CompressionArg {
+    fn method(self) -> Option<CompressionMethod> {
+        match self {
+            CompressionArg::None => None,
+            CompressionArg::Zlib => Some(CompressionMethod::Zlib),
+            CompressionArg::Zstd => Some(CompressionMethod::Zstd),
+            CompressionArg::Lz4 => Some(CompressionMethod::LZ4),
+            CompressionArg::Oodle => Some(CompressionMethod::Oodle),
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -283,6 +312,9 @@ struct Args {
     override_container_header_version: Option<EIoContainerHeaderVersion>,
     #[arg(long)]
     override_toc_version: Option<EIoStoreTocVersion>,
+    /// Game whose tooling the output reproduces; also supplies its AES key when -a is not given
+    #[arg(long, value_enum, default_value_t)]
+    game: GameVariant,
     #[command(subcommand)]
     action: Action,
 }
@@ -295,8 +327,11 @@ fn main() -> Result<()> {
         toc_version_override: args.override_toc_version,
         ..Default::default()
     };
+    let stub_key = args.aes_key.clone();
     if let Some(aes) = args.aes_key {
         config.aes_keys.insert(FGuid::default(), AesKey::from_str(&aes)?);
+    } else if let Some(key) = args.game.default_aes_key() {
+        config.aes_keys.insert(FGuid::default(), key);
     }
     let config = Arc::new(config);
 
@@ -311,7 +346,7 @@ fn main() -> Result<()> {
         Action::PackRaw(action) => action_pack_raw(action, config),
 
         Action::ToLegacy(action) => action_to_legacy(action, config),
-        Action::ToZen(action) => action_to_zen(action, config),
+        Action::ToZen(action) => action_to_zen(action, config, args.game, stub_key),
 
         Action::Get(action) => action_get(action, config),
 
@@ -765,7 +800,7 @@ fn action_to_legacy_shaders(args: &ActionToLegacy, file_writer: &dyn FileWriterT
     Ok(())
 }
 
-fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
+fn action_to_zen(args: ActionToZen, config: Arc<Config>, game: GameVariant, stub_key: Option<String>) -> Result<()> {
     let mount_point = UEPath::new("../../../");
 
     let input: Box<dyn FileReaderTrait> = if args.input.is_dir() { Box::new(FSFileReader::new(args.input)) } else { Box::new(PakFileReader::new(args.input)?) };
@@ -774,7 +809,13 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
 
     let toc_version = config.toc_version_override.unwrap_or(args.version.toc_version());
 
-    let mut writer = IoStoreWriter::new(&args.output, toc_version, Some(container_header_version), mount_point.into())?;
+    let obfuscate_with = if args.obfuscate {
+        Some(config.aes_keys.get(&FGuid::default()).cloned().context("--obfuscate needs an AES key (-a, or --game rivals)")?)
+    } else {
+        None
+    };
+    let writer_options = game.writer_options(args.compression.map(CompressionArg::method), obfuscate_with)?;
+    let mut writer = IoStoreWriter::with_options(&args.output, toc_version, Some(container_header_version), mount_point.into(), writer_options)?;
 
     let log = Log::new_stdout(args.verbose, args.debug);
     let mut asset_paths = vec![];
@@ -867,6 +908,7 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
                 script_objects.clone(),
                 Some(script_cell_store.clone()),
                 &log,
+                game,
             )?;
 
             tx.send(converted)?;
@@ -936,7 +978,9 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
 
     // create empty pak file if one does not already exist (necessary for game to detect and load container)
     let pak_path = Path::new(&args.output).with_extension("pak");
-    if !pak_path.exists() {
+    if game == GameVariant::MarvelRivals {
+        marvel_rivals::write_companion_pak(&pak_path, mount_point.as_str())?;
+    } else if !pak_path.exists() {
         // Real Marvel Rivals companion stubs are V11 AND AES-encrypted with the same key used
         // for IoStore content - confirmed against `natimerry/retoc-rivals` (a purpose-built,
         // community-maintained fork whose `write_companion_pak` does exactly this: V11, real
@@ -948,13 +992,8 @@ fn action_to_zen(args: ActionToZen, config: Arc<Config>) -> Result<()> {
         // pair for our own, in either direction, broke it - only real+real or (once this is
         // right) ours+ours should work). The manual-decrypt failure was a methodology bug, not
         // a real second key.
-        let mut pak_builder = repak::PakBuilder::new();
-        if let Some(aes_key) = config.aes_keys.get(&FGuid::default()) {
-            pak_builder = pak_builder.key(aes_key.cipher().clone()).variant(repak::PakVariant::MarvelRivals);
-        }
-        pak_builder
-            .writer(&mut BufWriter::new(fs::File::create(pak_path)?), repak::Version::V11, mount_point.to_string(), Some(0))
-            .write_index()?;
+        // The stub key is the -a key with each 4-byte word byte-reversed, as retoc-rivals parses it.
+        marvel_rivals::write_pak_stub(&pak_path, mount_point.as_str(), stub_key.as_deref())?;
     }
 
     Ok(())
