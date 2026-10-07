@@ -109,11 +109,39 @@ impl Log {
     }
     pub fn log(&self, level: LogLevel, msg: &str) {
         if self.is_level_enabled(level) {
-            if let Some(progress) = self.progress.lock().unwrap().as_ref() {
+            // A hidden bar (output not a terminal) drops println, so go straight to the backend then.
+            if let Some(progress) = self.progress.lock().unwrap().as_ref().filter(|p| !p.is_hidden()) {
                 progress.println(msg);
             } else {
                 self.backend.write_message(level, msg);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingLogBackend(Mutex<Vec<String>>);
+    impl LogBackend for RecordingLogBackend {
+        fn write_message(&self, _level: LogLevel, msg: &str) {
+            self.0.lock().unwrap().push(msg.to_string());
+        }
+    }
+
+    #[test]
+    fn messages_reach_backend_when_progress_bar_is_hidden() {
+        // A progress bar is hidden when its output is not a terminal (piped or redirected), and a hidden bar's
+        // println discards the line, so a caller capturing the output would see nothing.
+        let backend = Arc::new(RecordingLogBackend::default());
+        let log = Log::new(LogLevel::Info, backend.clone());
+        let progress = indicatif::ProgressBar::hidden();
+        log.set_progress(Some(&progress));
+
+        log.log(LogLevel::Info, "[MaterialTags] /Game/Mesh - Patched");
+
+        assert_eq!(*backend.0.lock().unwrap(), vec!["[MaterialTags] /Game/Mesh - Patched".to_string()]);
     }
 }
