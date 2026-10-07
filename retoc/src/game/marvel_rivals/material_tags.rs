@@ -228,21 +228,17 @@ fn patch_mesh_materials(data: &[u8], names: &[String], tags: &[MaterialSlotTags]
     Some(patched)
 }
 
-/// Tries the layouts in order: an array that already has tags, then one with empty containers, then a stock one.
+/// The earliest array of any layout: it follows the properties, and a large mesh's render data can hold bytes that pass
+/// as a short array of any layout. Ties go to the padded readings, since a one-entry padded array also reads as a stock one.
 fn find_material_array(data: &[u8], names: &[String], expected_slot_names: &[&str], package_name: &str, log: &Log) -> Option<MaterialArray> {
-    if let Some(array) = find_first_array(data, names, expected_slot_names, MaterialArrayLayout::PaddedTagged)
-        && array.byte_len > array.count * EMPTY_TAG_SKELETAL_MATERIAL_SIZE
-    {
-        info!(log, "[MaterialTags] {package_name} - Found prepatched tagged FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)", array.offset, array.count, array.score);
-        return Some(array);
-    }
-    for (layout, description) in [(MaterialArrayLayout::PaddedEmpty, "prepatched"), (MaterialArrayLayout::Legacy, "legacy")] {
-        if let Some(array) = find_first_array(data, names, expected_slot_names, layout) {
-            info!(log, "[MaterialTags] {package_name} - Found {description} FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)", array.offset, array.count, array.score);
-            return Some(array);
-        }
-    }
-    None
+    let find = |layout| find_first_array(data, names, expected_slot_names, layout);
+    let tagged = find(MaterialArrayLayout::PaddedTagged).filter(|array| array.byte_len > array.count * EMPTY_TAG_SKELETAL_MATERIAL_SIZE);
+    let (array, description) = [(tagged, "prepatched tagged"), (find(MaterialArrayLayout::PaddedEmpty), "prepatched"), (find(MaterialArrayLayout::Legacy), "legacy")]
+        .into_iter()
+        .filter_map(|(array, description)| array.map(|array| (array, description)))
+        .min_by_key(|(array, _)| array.offset)?;
+    info!(log, "[MaterialTags] {package_name} - Found {description} FSkeletalMaterial array at {:#X}: {} material(s), matched {} slot(s)", array.offset, array.count, array.score);
+    Some(array)
 }
 
 /// The first offset holding a plausible material count followed by that many valid entries of `layout`.
@@ -386,6 +382,38 @@ mod test {
         expected.extend(i32s(&[0]));
         expected.extend([0xAB; 4]);
         assert_eq!(patched, expected);
+    }
+
+    #[test]
+    fn stock_array_wins_over_a_later_padded_lookalike() {
+        // A large mesh's render data can hold bytes that pass as a one-entry padded array (seen at 0x5B4915 in a lobby mesh)
+        let names = names(&["None", "SlotA", "SlotB"]);
+        let mut data = legacy_mesh(&[material(-1, 1), material(-2, 2)]);
+        data.extend([0xAB; 60]);
+        data.extend(i32s(&[1]));
+        data.extend(material(-3, 1));
+        data.extend(i32s(&[0]));
+        let patched = patch_mesh_materials(&data, &names, &[], "/Game/Mesh", &Log::no_log()).expect("patched");
+
+        let mut expected = i32s(&[0, 2]);
+        expected.extend(material(-1, 1));
+        expected.extend(i32s(&[0]));
+        expected.extend(material(-2, 2));
+        expected.extend(i32s(&[0]));
+        expected.extend(&data[88..]);
+        assert_eq!(patched, expected);
+    }
+
+    #[test]
+    fn one_entry_padded_array_is_not_padded_again() {
+        // At its offset a one-entry padded array also reads as a stock one
+        let names = names(&["None", "SlotA"]);
+        let mut data = i32s(&[0, 1]);
+        data.extend(material(-1, 1));
+        data.extend(i32s(&[0]));
+        data.extend([0xAB; 4]);
+        let patched = patch_mesh_materials(&data, &names, &[], "/Game/Mesh", &Log::no_log());
+        assert!(patched.is_none_or(|p| p == data));
     }
 
     #[test]
