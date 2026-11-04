@@ -690,8 +690,8 @@ fn build_zen_dependency_bundle_new(builder: &mut ZenPackageBuilder, export_load_
         let mut result_dependencies: Vec<FDependencyBundleEntry> = Vec::new();
 
         for from_dependency_node in export_dependencies.get(to_dependency_node).unwrap_or(&Vec::new()) {
-            // Skip nodes that do not have the matching command type, and nodes to ourselves (e.g. serialize depends on create)
-            if from_dependency_node.command_type == from_command_type && from_dependency_node.package_index != to_dependency_node.package_index {
+            // Skip nodes that do not have the matching command type, and the node itself. Serialize depending on create of the same export is kept, since it comes from the preload dependencies
+            if from_dependency_node.command_type == from_command_type && !(from_dependency_node.package_index == to_dependency_node.package_index && from_dependency_node.command_type == to_dependency_node.command_type) {
                 // If this is an export, add the dependency bundle entry at all times
                 if from_dependency_node.package_index.is_export() {
                     result_dependencies.push(FDependencyBundleEntry {
@@ -889,7 +889,10 @@ fn build_zen_preload_dependencies(builder: &mut ZenPackageBuilder) -> anyhow::Re
         let mut serialize_dependencies: Vec<ZenDependencyGraphNode> = Vec::new();
 
         //This export's serialize has a dependency on this export's create. This dependency is added first because it is added before anything else by the Package Store Optimizer
-        serialize_dependencies.push(create_graph_node);
+        // Starting with NoExportInfo, dependency bundles only list it when the preload dependencies do, so there it is only added to the sort graph below
+        if builder.container_header_version < EIoContainerHeaderVersion::NoExportInfo {
+            serialize_dependencies.push(create_graph_node);
+        }
 
         // Collect create and serialize dependencies for this export
         if object_export.first_export_dependency_index != -1 {
@@ -1009,6 +1012,17 @@ fn build_zen_preload_dependencies(builder: &mut ZenPackageBuilder) -> anyhow::Re
     // Build a reverse lookup from export to exports that depend on it
     let mut dependency_to_dependants: HashMap<ZenExportGraphNode, Vec<ZenExportGraphNode>> = HashMap::with_capacity(export_count);
     for dependant_node in &export_graph_nodes {
+        // Each export has to be created before it is serialized, even if its dependency bundle does not list its own create
+        if builder.container_header_version >= EIoContainerHeaderVersion::NoExportInfo && dependant_node.node.command_type == EExportCommandType::Serialize && (dependant_node.node.package_index.to_export_index() as usize) < export_count {
+            let create_node = ZenExportGraphNode {
+                node: ZenDependencyGraphNode {
+                    command_type: EExportCommandType::Create,
+                    ..dependant_node.node
+                },
+                ..*dependant_node
+            };
+            dependency_to_dependants.entry(create_node).or_default().push(*dependant_node);
+        }
         if let Some(dependencies) = export_dependencies.get(&dependant_node.node) {
             for raw_dependency_node in dependencies {
                 // Skip non-export dependencies from exports. They do not matter for graph building purposes
@@ -1401,6 +1415,173 @@ mod test {
         run_test("tests/UE5.6/M_Mannequin", ue5_7, None)?;
         run_test("tests/UE5.6/SK_Mannequin", ue5_7, None)?;
 
+        Ok(())
+    }
+
+    // Stock UE5.3+ fixtures, which use the single export bundle and per-export dependency bundles
+    fn dependency_bundle_fixtures() -> Vec<(&'static str, (EIoStoreTocVersion, EIoContainerHeaderVersion, FPackageFileVersion))> {
+        let version = |eng: EngineVersion| (eng.toc_version(), eng.container_header_version(), eng.package_file_version());
+        vec![
+            ("tests/UE5.4/BP_Table_Lamp", version(EngineVersion::UE5_4)),
+            ("tests/UE5.4/Randy", version(EngineVersion::UE5_4)),
+            ("tests/UE5.5/T_Test", version(EngineVersion::UE5_5)),
+            ("tests/UE5.5/SM_Cube", version(EngineVersion::UE5_5)),
+            ("tests/UE5.5/BP_ThirdPersonCharacter", version(EngineVersion::UE5_5)),
+            ("tests/UE5.6/T_Quinn_01_D", version(EngineVersion::UE5_6)),
+            ("tests/UE5.6/SM_Cube", version(EngineVersion::UE5_6)),
+            ("tests/UE5.6/BP_ThirdPersonCharacter", version(EngineVersion::UE5_6)),
+            ("tests/UE5.6/M_Mannequin", version(EngineVersion::UE5_6)),
+            ("tests/UE5.6/SK_Mannequin", version(EngineVersion::UE5_6)),
+        ]
+    }
+
+    fn read_fixture(path: &str, version: (EIoStoreTocVersion, EIoContainerHeaderVersion, FPackageFileVersion)) -> anyhow::Result<(FLegacyPackageHeader, FZenPackageHeader)> {
+        let path = std::path::Path::new(path);
+        let legacy_package = FLegacyPackageHeader::deserialize(&mut Cursor::new(fs::read(path.with_extension("uasset"))?), Some(version.2))?;
+        let zen_package = FZenPackageHeader::deserialize(&mut Cursor::new(fs::read(path.with_extension("uzenasset"))?), None, version.0, version.1, Some(version.2))?;
+        Ok((legacy_package, zen_package))
+    }
+
+    // Runs the legacy to zen header conversion, without serializing the package
+    fn convert_legacy_package(legacy_package: FLegacyPackageHeader, container_header_version: EIoContainerHeaderVersion) -> anyhow::Result<FZenPackageHeader> {
+        let log = Log::no_log();
+        let mut builder = create_asset_builder(legacy_package, container_header_version, false, None, None, None, &log);
+        setup_zen_package_summary(&mut builder)?;
+        build_zen_import_map(&mut builder)?;
+        build_zen_export_map(&mut builder)?;
+        build_zen_preload_dependencies(&mut builder)?;
+        Ok(builder.zen_package)
+    }
+
+    // Returns the dependency bundle entries of the given export, in CBC, SBC, CBS, SBS order
+    fn dependency_bundle_lists(package: &FZenPackageHeader, export_index: usize) -> [Vec<FPackageIndex>; 4] {
+        let header = package.dependency_bundle_headers[export_index];
+        let counts = [header.create_before_create_dependencies, header.serialize_before_create_dependencies, header.create_before_serialize_dependencies, header.serialize_before_serialize_dependencies];
+        let mut next_entry_index = header.first_entry_index.max(0) as usize;
+        counts.map(|count| {
+            let entries = &package.dependency_bundle_entries[next_entry_index..next_entry_index + count as usize];
+            next_entry_index += count as usize;
+            entries.iter().map(|x| x.local_import_or_export_index).collect()
+        })
+    }
+
+    // Replaces the preload dependencies of the legacy package with the ones zen to legacy conversion derives from the zen package
+    // (see asset_conversion::resolve_export_dependencies). Only export entries are kept, because zen and legacy import maps are ordered differently
+    fn rebuild_preload_dependencies_from_zen(legacy_package: &mut FLegacyPackageHeader, zen_package: &FZenPackageHeader) {
+        assert!(legacy_package.cell_exports.is_empty());
+        legacy_package.preload_dependencies.clear();
+        for (export_index, export) in legacy_package.exports.iter_mut().enumerate() {
+            let [mut create_before_create, mut serialize_before_create, mut create_before_serialize, mut serialize_before_serialize] = dependency_bundle_lists(zen_package, export_index).map(|list| list.into_iter().filter(|x| x.is_export()).collect::<Vec<_>>());
+
+            if !export.outer_index.is_null() && !create_before_create.contains(&export.outer_index) {
+                create_before_create.push(export.outer_index);
+            }
+            if !export.super_index.is_null() && !create_before_create.contains(&export.super_index) {
+                serialize_before_serialize.push(export.super_index);
+            }
+            if !export.class_index.is_null() && !serialize_before_create.contains(&export.class_index) {
+                serialize_before_create.push(export.class_index);
+            }
+            if !export.template_index.is_null() && !serialize_before_create.contains(&export.template_index) {
+                serialize_before_create.push(export.template_index);
+            }
+
+            export.first_export_dependency_index = legacy_package.preload_dependencies.len() as i32;
+            export.serialize_before_serialize_dependencies = serialize_before_serialize.len() as i32;
+            export.create_before_serialize_dependencies = create_before_serialize.len() as i32;
+            export.serialize_before_create_dependencies = serialize_before_create.len() as i32;
+            export.create_before_create_dependencies = create_before_create.len() as i32;
+            legacy_package.preload_dependencies.append(&mut serialize_before_serialize);
+            legacy_package.preload_dependencies.append(&mut create_before_serialize);
+            legacy_package.preload_dependencies.append(&mut serialize_before_create);
+            legacy_package.preload_dependencies.append(&mut create_before_create);
+        }
+    }
+
+    // Checks that the export bundle order satisfies every dependency of every export, including that each export is created before it is serialized
+    fn check_load_order(package: &FZenPackageHeader) -> Result<(), String> {
+        let mut positions: HashMap<(u32, EExportCommandType), usize> = HashMap::new();
+        for (position, entry) in package.export_bundle_entries.iter().enumerate() {
+            if positions.insert((entry.local_export_index, entry.command_type), position).is_some() {
+                return Err(format!("Export {} {:?} appears in the export bundle more than once", entry.local_export_index, entry.command_type));
+            }
+        }
+        let position = |export_index: u32, command_type: EExportCommandType| positions.get(&(export_index, command_type)).copied().ok_or(format!("Export {export_index} {command_type:?} is missing from the export bundle"));
+
+        for export_index in 0..package.export_map.len() as u32 {
+            if position(export_index, EExportCommandType::Create)? > position(export_index, EExportCommandType::Serialize)? {
+                return Err(format!("Export {export_index} is serialized before it is created"));
+            }
+            let [create_before_create, serialize_before_create, create_before_serialize, serialize_before_serialize] = dependency_bundle_lists(package, export_index as usize);
+            let dependencies = [
+                (create_before_create, EExportCommandType::Create, EExportCommandType::Create),
+                (serialize_before_create, EExportCommandType::Serialize, EExportCommandType::Create),
+                (create_before_serialize, EExportCommandType::Create, EExportCommandType::Serialize),
+                (serialize_before_serialize, EExportCommandType::Serialize, EExportCommandType::Serialize),
+            ];
+            for (list, from_command_type, to_command_type) in dependencies {
+                for from_index in list.into_iter().filter(|x| x.is_export()) {
+                    if position(from_index.to_export_index(), from_command_type)? > position(export_index, to_command_type)? {
+                        return Err(format!("Export {export_index} {to_command_type:?} is ordered before its dependency export {} {from_command_type:?}", from_index.to_export_index()));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Stock packages list some exports as create before serialize dependencies of themselves, which have to be kept
+    #[test]
+    fn test_dependency_bundles_match_original() -> anyhow::Result<()> {
+        let mut mismatches = Vec::new();
+        for (path, version) in dependency_bundle_fixtures() {
+            let (legacy_package, original_zen_package) = read_fixture(path, version)?;
+            let converted_zen_package = convert_legacy_package(legacy_package, version.1)?;
+            for export_index in 0..original_zen_package.export_map.len() {
+                let original = dependency_bundle_lists(&original_zen_package, export_index);
+                let converted = dependency_bundle_lists(&converted_zen_package, export_index);
+                if original != converted {
+                    mismatches.push(format!("{path} export {export_index}: original {original:?}, converted {converted:?}"));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "Dependency bundles do not match ([CBC, SBC, CBS, SBS]):\n{}", mismatches.join("\n"));
+        Ok(())
+    }
+
+    // Simulates zen -> legacy -> zen for the given legacy package and zen package it was converted from, and checks the resulting load order
+    fn check_round_trip_load_order(legacy_package: &FLegacyPackageHeader, source_zen_package: &FZenPackageHeader, container_header_version: EIoContainerHeaderVersion) -> Result<(), String> {
+        let mut round_trip_legacy_package = legacy_package.clone();
+        rebuild_preload_dependencies_from_zen(&mut round_trip_legacy_package, source_zen_package);
+        let round_trip_zen_package = convert_legacy_package(round_trip_legacy_package, container_header_version).map_err(|error| error.to_string())?;
+        check_load_order(&round_trip_zen_package)
+    }
+
+    #[test]
+    fn test_export_round_trip_load_order() -> anyhow::Result<()> {
+        let mut failures = Vec::new();
+        for (path, version) in dependency_bundle_fixtures() {
+            let (legacy_package, original_zen_package) = read_fixture(path, version)?;
+            let converted_zen_package = convert_legacy_package(legacy_package.clone(), version.1)?;
+            let results = [
+                ("original", check_load_order(&original_zen_package)),
+                ("converted", check_load_order(&converted_zen_package)),
+                ("round trip from original", check_round_trip_load_order(&legacy_package, &original_zen_package, version.1)),
+                ("round trip from converted", check_round_trip_load_order(&legacy_package, &converted_zen_package, version.1)),
+            ];
+            failures.extend(results.into_iter().filter_map(|(name, result)| result.err().map(|error| format!("{path} ({name}): {error}"))));
+        }
+
+        // A subobject whose archetype is a later export in the same package. Zen to legacy conversion makes its Create wait for the archetype's Serialize,
+        // while its own Serialize has no dependencies, so only the implicit Create before Serialize dependency keeps it after its Create
+        let (path, version) = dependency_bundle_fixtures().into_iter().find(|(path, _)| *path == "tests/UE5.5/SM_Cube").unwrap();
+        let (mut legacy_package, original_zen_package) = read_fixture(path, version)?;
+        legacy_package.exports[0].template_index = FPackageIndex::create_export(1);
+        if let Err(error) = check_round_trip_load_order(&legacy_package, &original_zen_package, version.1) {
+            failures.push(format!("{path} (round trip with a later archetype export): {error}"));
+        }
+
+        assert!(failures.is_empty(), "Export load order is invalid:\n{}", failures.join("\n"));
         Ok(())
     }
 
