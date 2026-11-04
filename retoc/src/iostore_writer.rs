@@ -20,8 +20,6 @@ pub struct IoStoreWriterOptions {
     pub compression: Option<CompressionMethod>,
     pub oodle_compressor: oodle_loader::Compressor,
     pub compress_container_header: bool,
-    /// Store the whole 32-byte blake3 digest; otherwise the first 20 bytes, zero-padded.
-    pub full_chunk_hash: bool,
     /// Set the Compressed meta flag on chunks that have at least one compressed block.
     pub mark_compressed_chunks: bool,
     /// Store a block raw when the compressor fails, instead of failing the write.
@@ -36,7 +34,6 @@ impl Default for IoStoreWriterOptions {
             compression: Some(CompressionMethod::Oodle),
             oodle_compressor: oodle_loader::Compressor::Mermaid,
             compress_container_header: true,
-            full_chunk_hash: true,
             mark_compressed_chunks: true,
             fallback_to_raw_on_compression_error: true,
             encryption_key: None,
@@ -145,10 +142,7 @@ impl IoStoreWriter {
             offset += bytes_to_write.len() as u64;
         }
         let hash = hasher.finalize();
-        let mut chunk_hash = FIoChunkHash::from_blake3(hash.as_bytes());
-        if !self.options.full_chunk_hash {
-            chunk_hash.0[20..].fill(0);
-        }
+        let chunk_hash = FIoChunkHash::from_blake3(hash.as_bytes());
         let mut flags = FIoStoreTocEntryMetaFlags::empty();
         if any_block_compressed && self.options.mark_compressed_chunks {
             flags |= FIoStoreTocEntryMetaFlags::Compressed;
@@ -280,15 +274,11 @@ mod test {
     }
 
     #[test]
-    fn chunk_hash_is_full_blake3_or_truncated_to_20_bytes() -> Result<()> {
+    fn chunk_hash_is_blake3_truncated_to_20_bytes() -> Result<()> {
         // blake3("abc")
         let digest = hex::decode("6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85")?;
 
-        let full = read_toc(&write_container("hash_full", uncompressed(), None, &[("a.bin", b"abc")])?, None)?;
-        assert_eq!(full.chunk_metas[0].chunk_hash.0.as_slice(), digest.as_slice());
-
-        let options = IoStoreWriterOptions { full_chunk_hash: false, ..uncompressed() };
-        let truncated = read_toc(&write_container("hash_truncated", options, None, &[("a.bin", b"abc")])?, None)?;
+        let truncated = read_toc(&write_container("hash_truncated", uncompressed(), None, &[("a.bin", b"abc")])?, None)?;
         assert_eq!(&truncated.chunk_metas[0].chunk_hash.0[..20], &digest[..20]);
         assert_eq!(truncated.chunk_metas[0].chunk_hash.0[20..], [0; 12]);
         Ok(())

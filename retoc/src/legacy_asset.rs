@@ -659,10 +659,8 @@ impl FPackageNameMap {
         self.store_parts(name_without_number, name_number)
     }
 
-    /// Stores an already-split (base, number) pair verbatim - the counterpart to `get_parts` and
-    /// to the zen name map's own `store_parts`, so a name can move between the two formats
-    /// without round-tripping through a display string (see `FNameMap::store_exact`'s doc
-    /// comment in `name_map.rs` for why that round trip corrupts a name like "..._1031316").
+    /// Stores an already-split (base, number) pair verbatim, the counterpart to `get_parts` and to
+    /// the zen name map's own `store_parts`.
     pub fn store_parts(&mut self, name_without_number: &str, name_number: i32) -> FMinimalName {
         // Attempt to resolve the existing name through lookup
         if let Some(existing_index) = self.name_lookup.get(name_without_number) {

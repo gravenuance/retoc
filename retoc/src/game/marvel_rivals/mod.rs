@@ -38,7 +38,6 @@ pub(super) fn writer_options(compression: Option<CompressionMethod>, obfuscate_w
         compression,
         oodle_compressor: oodle_loader::Compressor::Kraken,
         compress_container_header: false,
-        full_chunk_hash: false,
         mark_compressed_chunks: false,
         fallback_to_raw_on_compression_error: false,
         encryption_key: obfuscate_with,

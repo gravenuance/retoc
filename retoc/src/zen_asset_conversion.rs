@@ -174,7 +174,7 @@ fn setup_zen_package_summary(builder: &mut ZenPackageBuilder) -> anyhow::Result<
     if builder.container_header_version <= EIoContainerHeaderVersion::Initial {
         // Require a source package name be either found or supplied externally from somewhere
         let source_package_name = builder.source_package_name.as_deref().expect("source_package_name required");
-        builder.zen_package.summary.source_name = builder.zen_package.name_map.store_exact(source_package_name);
+        builder.zen_package.summary.source_name = builder.zen_package.name_map.store(source_package_name);
     }
 
     // Copy bulk resources from the legacy package without modifications
@@ -723,11 +723,7 @@ fn build_zen_dependency_bundle_new(builder: &mut ZenPackageBuilder, export_load_
                         local_import_or_export_index: from_dependency_node.package_index,
                     });
                 }
-                // Otherwise, if this is an import, add it as long as it actually resolved to something -
-                // a real cooked package can depend on a ScriptImport (e.g. a native class or its CDO)
-                // just as validly as a PackageImport, confirmed against a real cooked package whose
-                // dependency bundle includes exactly such entries. Excluding anything but PackageImport
-                // here silently dropped those real dependencies.
+                // Otherwise, if this is an import, we only add it if it's a package export import
                 else if from_dependency_node.package_index.is_import() {
                     // Note that we are working with "extended" package indices here, where raw import index could refer either to normal import or to cell import
                     // We need to handle both here separately since both of them are relevant for dependency sorting
@@ -738,12 +734,7 @@ fn build_zen_dependency_bundle_new(builder: &mut ZenPackageBuilder, export_load_
                         immut_builder.zen_package.cell_import_map[raw_import_index - immut_builder.zen_package.import_map.len()]
                     };
 
-                    let is_kept_import = if immut_builder.rules.script_import_dependencies {
-                        zen_import_package_index.kind() != FPackageObjectIndexType::Null
-                    } else {
-                        zen_import_package_index.kind() == FPackageObjectIndexType::PackageImport
-                    };
-                    if is_kept_import {
+                    if zen_import_package_index.kind() == FPackageObjectIndexType::PackageImport {
                         result_dependencies.push(FDependencyBundleEntry {
                             local_import_or_export_index: from_dependency_node.package_index,
                         });
@@ -1322,6 +1313,15 @@ impl ConvertedZenAssetBundle {
     }
 }
 
+// Finally store and set package summary name
+fn store_package_name_last(builder: &mut ZenPackageBuilder) {
+    if builder.rules.package_name_stored_last && builder.container_header_version > EIoContainerHeaderVersion::Initial {
+        builder.zen_package.summary.name = builder.zen_package.name_map.store(&builder.legacy_package.summary.package_name);
+    } else if builder.rules.package_name_stored_last {
+        builder.zen_package.summary.name = builder.zen_package.name_map.store(builder.source_package_name.as_deref().unwrap_or("None"));
+    }
+}
+
 fn build_zen_asset_internal<'a>(
     legacy_asset: &FSerializedAssetBundle,
     container_header_version: EIoContainerHeaderVersion,
@@ -1346,13 +1346,7 @@ fn build_zen_asset_internal<'a>(
     build_zen_import_map(&mut builder)?;
     build_zen_export_map(&mut builder)?;
     build_zen_preload_dependencies(&mut builder)?;
-
-    // Finally store and set package summary name
-    if builder.rules.package_name_stored_last && builder.container_header_version > EIoContainerHeaderVersion::Initial {
-        builder.zen_package.summary.name = builder.zen_package.name_map.store_exact(&builder.legacy_package.summary.package_name);
-    } else if builder.rules.package_name_stored_last {
-        builder.zen_package.summary.name = builder.zen_package.name_map.store_exact(builder.source_package_name.as_deref().unwrap_or("None"));
-    }
+    store_package_name_last(&mut builder);
 
     Ok(builder)
 }
@@ -1633,11 +1627,12 @@ mod game_variant_test {
 
     #[test]
     fn standard_output_is_unchanged() -> anyhow::Result<()> {
-        // blake3 of the serialized package as converted at 8c47bd5, before game variants existed
+        // blake3 of the serialized package: SM_Cube and T_Test as upstream 885a8da converts them; BP_ThirdPersonCharacter
+        // differs from upstream only by the self dependencies its stock .uzenasset has and upstream drops
         for (name, expected) in [
-            ("SM_Cube", "e0e34df0a34ae83f283a324a049d7e82e1bf35b4e06b5f056c76c24e6afd6013"),
-            ("T_Test", "22d11527191983999992505439c0db639552d503b3554ce0ef1c3897fcbf128d"),
-            ("BP_ThirdPersonCharacter", "817019d7a517569c6e30cccea818b03f051471d06f4e12b2ac405fa232fe3b1f"),
+            ("SM_Cube", "d0bc894a1f0224d4d76590fec4062200bc994770bb253870da2c129af0903220"),
+            ("T_Test", "b5db0a45f42160c5b370cb4a04eea6a57aada29ed03c2a1305a61639df6896ae"),
+            ("BP_ThirdPersonCharacter", "ec8ebd6606d45410f63ea9b7005d786b7ba6a98c25a42753ae4998b1a6d6cdfa"),
         ] {
             let version = EngineVersion::UE5_5;
             let bundle = read_bundle(name)?;
@@ -1658,15 +1653,51 @@ mod game_variant_test {
     }
 
     #[test]
-    fn rivals_dependency_bundles_drop_script_imports_and_self_dependencies() -> anyhow::Result<()> {
-        // T_Test's only dependencies are its two script imports and serialize-on-create for its own export
-        assert_eq!(convert("T_Test", GameVariant::Standard)?.dependency_bundle_entries.len(), 2);
-        assert_eq!(convert("T_Test", GameVariant::MarvelRivals)?.dependency_bundle_entries.len(), 0);
+    fn dependency_bundles_drop_script_imports() -> anyhow::Result<()> {
+        for game in [GameVariant::Standard, GameVariant::MarvelRivals] {
+            // T_Test's only import dependencies are two script imports; the stock T_Test.uzenasset has no entries
+            assert_eq!(convert("T_Test", game)?.dependency_bundle_entries.len(), 0, "{game:?}");
 
-        let rivals = convert("SM_Cube", GameVariant::MarvelRivals)?;
-        for entry in rivals.dependency_bundle_entries.iter().filter(|e| e.local_import_or_export_index.is_import()) {
-            assert_eq!(rivals.import_map[entry.local_import_or_export_index.to_import_index() as usize].kind(), FPackageObjectIndexType::PackageImport);
+            let package = convert("SM_Cube", game)?;
+            for entry in package.dependency_bundle_entries.iter().filter(|e| e.local_import_or_export_index.is_import()) {
+                assert_eq!(package.import_map[entry.local_import_or_export_index.to_import_index() as usize].kind(), FPackageObjectIndexType::PackageImport, "{game:?}");
+            }
         }
+        // The stock SM_Cube.uzenasset has 6 entries
+        assert_eq!(convert("SM_Cube", GameVariant::Standard)?.dependency_bundle_entries.len(), 6);
+        Ok(())
+    }
+
+    type NameParts = (String, i32);
+
+    /// Runs summary setup and the final package name store on SM_Cube renamed to `package_name`.
+    /// Returns the summary's name and, for UE4 containers, its source name.
+    fn package_name_parts(package_name: &str, container_header_version: EIoContainerHeaderVersion, source_package_name: Option<String>) -> anyhow::Result<(NameParts, Option<NameParts>)> {
+        let log = Log::no_log();
+        let bundle = read_bundle("SM_Cube")?;
+        let mut header = FLegacyPackageHeader::deserialize(&mut Cursor::new(&bundle.asset_file_buffer), Some(EngineVersion::UE5_5.package_file_version()))?;
+        header.summary.package_name = package_name.to_string();
+        let mut builder = create_asset_builder(header, container_header_version, false, source_package_name, None, None, &log, GameVariant::Standard);
+        setup_zen_package_summary(&mut builder)?;
+        store_package_name_last(&mut builder);
+        let package = &builder.zen_package;
+        let parts = |name| {
+            let (base, number) = package.name_map.get_parts(name);
+            (base.to_string(), number)
+        };
+        let source_name = (container_header_version <= EIoContainerHeaderVersion::Initial).then(|| parts(package.summary.source_name));
+        Ok((parts(package.summary.name), source_name))
+    }
+
+    #[test]
+    fn standard_splits_a_package_name_with_a_numeric_suffix() -> anyhow::Result<()> {
+        // UE's FName constructor splits "/Game/Meshes/SM_Cube_1033001" into ("/Game/Meshes/SM_Cube", 1033001 + 1)
+        let (name, _) = package_name_parts("/Game/Meshes/SM_Cube_1033001", EngineVersion::UE5_5.container_header_version(), None)?;
+        assert_eq!(name, ("/Game/Meshes/SM_Cube".to_string(), 1_033_002));
+
+        let (name, source_name) = package_name_parts("/Game/Meshes/SM_Cube_1033001", EngineVersion::UE4_27.container_header_version(), Some("/Game/Meshes/SM_Cube_1033001".to_string()))?;
+        assert_eq!(name, ("/Game/Meshes/SM_Cube".to_string(), 1_033_002));
+        assert_eq!(source_name, Some(("/Game/Meshes/SM_Cube".to_string(), 1_033_002)));
         Ok(())
     }
 

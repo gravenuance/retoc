@@ -24,8 +24,8 @@ pub enum GameVariant {
 /// Choices in legacy-to-zen package conversion where a game's reference packer differs from retoc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZenConversionRules {
-    /// Package and export names are stored exactly as the legacy package splits them. When false, a
-    /// name is formatted to a string and split again, so "SK_1033_1033001" becomes ("SK_1033", 1033002).
+    /// Export names are stored exactly as the legacy package splits them. When false, a name is
+    /// formatted to a string and split again, so "SK_1033_1033001" becomes ("SK_1033", 1033002).
     pub exact_names: bool,
     /// The package's own name is added to the name map after every other name, as the editor does.
     /// When false it is added right after the copied names, before imports and exports are converted.
@@ -36,8 +36,6 @@ pub struct ZenConversionRules {
     /// is added only before NoExportInfo. When false, every dependency between an export's own nodes is
     /// dropped and serialize-on-create is always added first.
     pub exact_self_dependencies: bool,
-    /// Script imports are kept in dependency bundles. When false only package imports are.
-    pub script_import_dependencies: bool,
 }
 
 impl GameVariant {
@@ -48,14 +46,12 @@ impl GameVariant {
                 package_name_stored_last: true,
                 sort_imported_packages: true,
                 exact_self_dependencies: true,
-                script_import_dependencies: true,
             },
             GameVariant::MarvelRivals => ZenConversionRules {
                 exact_names: false,
                 package_name_stored_last: false,
                 sort_imported_packages: false,
                 exact_self_dependencies: false,
-                script_import_dependencies: false,
             },
         }
     }
@@ -112,9 +108,9 @@ mod test {
     #[test]
     fn standard_rules_keep_retoc_fixes_and_rivals_rules_turn_them_off() {
         let standard = GameVariant::Standard.zen_conversion_rules();
-        assert!(standard.exact_names && standard.package_name_stored_last && standard.sort_imported_packages && standard.exact_self_dependencies && standard.script_import_dependencies);
+        assert!(standard.exact_names && standard.package_name_stored_last && standard.sort_imported_packages && standard.exact_self_dependencies);
         let rivals = GameVariant::MarvelRivals.zen_conversion_rules();
-        assert!(!rivals.exact_names && !rivals.package_name_stored_last && !rivals.sort_imported_packages && !rivals.exact_self_dependencies && !rivals.script_import_dependencies);
+        assert!(!rivals.exact_names && !rivals.package_name_stored_last && !rivals.sort_imported_packages && !rivals.exact_self_dependencies);
     }
 
     #[test]
@@ -123,7 +119,6 @@ mod test {
         assert_eq!(options.compression, Some(CompressionMethod::Oodle));
         assert!(matches!(options.oodle_compressor, oodle_loader::Compressor::Mermaid));
         assert!(options.compress_container_header);
-        assert!(options.full_chunk_hash);
         assert!(options.mark_compressed_chunks);
         assert!(options.fallback_to_raw_on_compression_error);
         assert!(options.encryption_key.is_none());
@@ -135,7 +130,6 @@ mod test {
         assert_eq!(options.compression, Some(CompressionMethod::Oodle));
         assert!(matches!(options.oodle_compressor, oodle_loader::Compressor::Kraken));
         assert!(!options.compress_container_header);
-        assert!(!options.full_chunk_hash);
         assert!(!options.mark_compressed_chunks);
         assert!(!options.fallback_to_raw_on_compression_error);
         assert!(options.encryption_key.is_none());
