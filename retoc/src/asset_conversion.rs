@@ -10,7 +10,7 @@ use crate::script_objects::{FPackageObjectIndex, FPackageObjectIndexType, FScrip
 use crate::ser::{ReadExt, Utf8String, WriteExt};
 use crate::verse_vm_types::VPackage;
 use crate::zen::{EExportCommandType, EExportFilterFlags, EObjectFlags, FCellExportMapEntry, FExportMapEntry, FExternalDependencyArc, FInternalDependencyArc, FPackageFileVersion, FPackageIndex, FZenPackageHeader, FZenPackageVersioningInfo, ZenScriptCellsStore};
-use crate::zen_asset_conversion::get_cell_export_hash;
+use crate::zen_asset_conversion::{get_cell_export_hash, get_public_export_hash};
 use crate::{EIoChunkType, FGuid, FIoChunkId, FPackageId, FileWriterTrait, UEPath};
 use crate::{debug, info, verbose, warning};
 use anyhow::{anyhow, bail};
@@ -307,7 +307,14 @@ fn resolve_package_import(package_cache: &FZenPackageContext, package_header: &F
     }
 }
 
-fn resolve_package_import_internal_new_common(package_cache: &FZenPackageContext, package_header: &FZenPackageHeader, import: FPackageObjectIndex) -> anyhow::Result<(FPackageId, Arc<FZenPackageHeader>, u64)> {
+// The package an import points at and its public export hash, bounds-checked against the header
+struct PackageImportTarget<'h> {
+    package_id: FPackageId,
+    package_name: Option<&'h str>,
+    public_export_hash: u64,
+}
+
+fn package_import_target(package_header: &FZenPackageHeader, import: FPackageObjectIndex) -> anyhow::Result<PackageImportTarget<'_>> {
     let package_import = import.package_import().ok_or_else(|| anyhow!("Failed to resolve import {} as package import", import))?;
 
     // Make sure package index points to a valid index in the imported packages
@@ -331,30 +338,70 @@ fn resolve_package_import_internal_new_common(package_cache: &FZenPackageContext
         );
     }
     let public_export_hash: u64 = package_header.imported_public_export_hashes[package_import.imported_public_export_hash_index as usize];
+    let package_name = package_header.imported_package_names.get(package_import.imported_package_index as usize).map(String::as_str);
+    Ok(PackageImportTarget { package_id, package_name, public_export_hash })
+}
+
+fn resolve_package_import_internal_new_common(package_cache: &FZenPackageContext, package_header: &FZenPackageHeader, import: FPackageObjectIndex) -> anyhow::Result<(FPackageId, Arc<FZenPackageHeader>, u64)> {
+    let target = package_import_target(package_header, import)?;
 
     // Resolve the imported package, and abort if we cannot resolve it
-    let resolved_import_package = package_cache.lookup(package_id)?;
+    let resolved_import_package = package_cache.lookup(target.package_id)?;
+    check_imported_package_name(&target, &resolved_import_package)?;
+    Ok((target.package_id, resolved_import_package, target.public_export_hash))
+}
 
-    // Sanity check - if we have imported package names, this package name must match the imported package name
-    if !package_header.imported_package_names.is_empty() {
-        let expected_imported_package_name = &package_header.imported_package_names[package_import.imported_package_index as usize];
+// Sanity check - if we have imported package names, this package name must match the imported package name
+fn check_imported_package_name(target: &PackageImportTarget, resolved_import_package: &FZenPackageHeader) -> anyhow::Result<()> {
+    if let Some(expected_imported_package_name) = target.package_name {
         let actual_imported_package_name = resolved_import_package.package_name();
-        if *expected_imported_package_name != actual_imported_package_name {
-            bail!("Imported package name mismatch: Expected to resolve imported package {}, but resolved {}", *expected_imported_package_name, actual_imported_package_name);
+        if expected_imported_package_name != actual_imported_package_name {
+            bail!("Imported package name mismatch: Expected to resolve imported package {}, but resolved {}", expected_imported_package_name, actual_imported_package_name);
         }
     }
-    Ok((package_id, resolved_import_package, public_export_hash))
+    Ok(())
+}
+
+// Names an import of a package that no container holds, from the header's imported package name. Only a package's
+// main asset can be named this way: its public export hash must be the hash of the package's leaf name
+fn infer_top_level_package_import(package_name: &str, public_export_hash: u64) -> Option<ResolvedZenImport> {
+    let object_name = package_name.rsplit('/').next().filter(|name| !name.is_empty())?;
+    if get_public_export_hash(&object_name.to_ascii_lowercase()) != public_export_hash {
+        return None;
+    }
+    let package = ResolvedZenImport {
+        class_package: CORE_OBJECT_PACKAGE_NAME.to_string(),
+        class_name: PACKAGE_CLASS_NAME.to_string(),
+        object_name: package_name.to_string(),
+        outer: None,
+    };
+    // The export's class lives in the missing package, so it can't be known
+    Some(ResolvedZenImport {
+        class_package: CORE_OBJECT_PACKAGE_NAME.to_string(),
+        class_name: OBJECT_CLASS_NAME.to_string(),
+        object_name: object_name.to_string(),
+        outer: Some(Box::new(package)),
+    })
 }
 
 fn resolve_package_import_internal_new(package_cache: &FZenPackageContext, package_header: &FZenPackageHeader, import: FPackageObjectIndex) -> anyhow::Result<ResolvedZenImport> {
-    let (_, resolved_import_package, public_export_hash) = resolve_package_import_internal_new_common(package_cache, package_header, import)?;
+    let target = package_import_target(package_header, import)?;
+    let inferred_import = || target.package_name.and_then(|package_name| infer_top_level_package_import(package_name, target.public_export_hash));
+
+    let resolved_import_package = match package_cache.lookup(target.package_id) {
+        Ok(resolved_import_package) => resolved_import_package,
+        Err(error) => {
+            let inferred = inferred_import().ok_or(error)?;
+            verbose!(package_cache.log, "Kept the path of import {} of package {}, which no container holds: {}", import, package_header.package_name(), target.package_name.unwrap_or_default());
+            return Ok(inferred);
+        }
+    };
+    check_imported_package_name(&target, &resolved_import_package)?;
 
     // Resolve the export that we are interested in. Note that the package passed to the resolve_package_export_internal must be the imported package, not this package
-    let imported_export = resolved_import_package
-        .export_map
-        .iter()
-        .find(|x| x.is_public_export() && x.public_export_hash == public_export_hash)
-        .ok_or_else(|| anyhow!("Failed to resolve public export with hash {} on package {} (imported by {})", public_export_hash, resolved_import_package.package_name(), package_header.package_name()))?;
+    let Some(imported_export) = resolved_import_package.export_map.iter().find(|x| x.is_public_export() && x.public_export_hash == target.public_export_hash) else {
+        return inferred_import().ok_or_else(|| anyhow!("Failed to resolve public export with hash {} on package {} (imported by {})", target.public_export_hash, resolved_import_package.package_name(), package_header.package_name()));
+    };
 
     resolve_package_export_internal(package_cache, resolved_import_package.as_ref(), imported_export)
 }
@@ -1262,82 +1309,108 @@ fn create_unknown_object_import_map_entry(builder: &mut LegacyAssetBuilder, oute
     }
 }
 
-fn finalize_asset(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
-    // Remap import map to the current indices
-    let import_map_size = max(builder.legacy_package.imports.len(), builder.zen_package.import_map.len());
-    let mut import_remap_map: HashMap<usize, usize> = HashMap::with_capacity(import_map_size);
-    let mut new_import_map: Vec<FObjectImport> = Vec::with_capacity(import_map_size);
+// Final import map layout: each slot holds a temporary import index, or None for a placeholder
+#[derive(Debug)]
+struct ImportReorderPlan {
+    import_order: Vec<Option<usize>>,
+    // Temporary import index -> final import index
+    import_remap: HashMap<usize, usize>,
+}
 
-    let current_import_indices_with_predefined_positions: HashSet<usize> = builder.original_import_order.values().copied().collect();
-    let mut current_legacy_asset_import_index: usize = 0;
-
-    for final_import_index in 0..import_map_size {
-        // If there is an original import to put in this position, use it
-        if let Some(existing_import_position) = builder.original_import_order.get(&final_import_index) {
-            import_remap_map.insert(*existing_import_position, final_import_index);
-            new_import_map.push(builder.legacy_package.imports[*existing_import_position].clone());
-            continue;
+// original_import_order maps a final (zen) import position to the temporary import that belongs there
+fn build_import_reorder_plan(current_import_count: usize, zen_import_count: usize, original_import_order: &HashMap<usize, usize>) -> anyhow::Result<ImportReorderPlan> {
+    for (&final_import_index, &current_import_index) in original_import_order {
+        if final_import_index >= zen_import_count {
+            bail!("Original import position {} is outside the zen import map with {} entries", final_import_index, zen_import_count);
         }
-        // Skip over the current imports that have predefined positions
-        while current_import_indices_with_predefined_positions.contains(&current_legacy_asset_import_index) {
-            current_legacy_asset_import_index += 1;
+        if current_import_index >= current_import_count {
+            bail!("Resolved import position {} is outside the temporary import map with {} entries", current_import_index, current_import_count);
         }
-        // We should never end up with fewer imports than we have to fill the holes, since zen never strips non-upackage exports
-        if current_legacy_asset_import_index >= builder.legacy_package.imports.len() {
-            // Attempt to handle this case gracefully by emitting a null import map entry. This allows us not to fail on extracting packages that might load fine otherwise (albeit with information loss)
-            // Log the warning regardless though because the information is lost
-            if !builder.has_failed_import_map_entries {
-                info!(
-                    builder.package_context.log,
-                    "Failed to find import map entry to fill the hole at {} while filling import map up to size {} for package {}. Null import map entry will be used instead",
-                    final_import_index,
-                    import_map_size,
-                    builder.legacy_package.summary.package_name.clone()
-                );
-            }
+    }
 
-            // We need a new import map entry here, and since it's not referenced by the original package, it can be a package entry, which will become Null again if asset is converted back to zen
-            new_import_map.push(create_unknown_package_import_map_entry(builder));
-            continue;
+    let predefined_import_indices: HashSet<usize> = original_import_order.values().copied().collect();
+    let mut import_order: Vec<Option<usize>> = Vec::with_capacity(max(current_import_count, zen_import_count));
+    let mut import_remap: HashMap<usize, usize> = HashMap::with_capacity(current_import_count);
+    let mut remaining_imports = (0..current_import_count).filter(|index| !predefined_import_indices.contains(index));
+
+    // Keep the whole zen import map region in place. Zen slots that resolved to the same import duplicate it, so
+    // the slots left over can be fewer than the imports added while resolving
+    for final_import_index in 0..zen_import_count {
+        let slot = original_import_order.get(&final_import_index).copied().or_else(|| remaining_imports.next());
+        if let Some(current_import_index) = slot {
+            import_remap.insert(current_import_index, final_import_index);
         }
+        import_order.push(slot);
+    }
+    // Append the imports no slot was left for
+    for current_import_index in remaining_imports {
+        import_remap.insert(current_import_index, import_order.len());
+        import_order.push(Some(current_import_index));
+    }
+    Ok(ImportReorderPlan { import_order, import_remap })
+}
 
-        // Take the current position and increment it by one
-        let existing_import_position = current_legacy_asset_import_index;
-        current_legacy_asset_import_index += 1;
+fn remap_package_index(package_index: FPackageIndex, import_remap: &HashMap<usize, usize>, package_name: &str) -> anyhow::Result<FPackageIndex> {
+    if !package_index.is_import() {
+        return Ok(package_index);
+    }
+    let current_import_index = package_index.to_import_index() as usize;
+    let new_import_index = import_remap
+        .get(&current_import_index)
+        .ok_or_else(|| anyhow!("Import {} referenced by package {} was not preserved while rebuilding its import map", current_import_index, package_name))?;
+    Ok(FPackageIndex::create_import(*new_import_index as u32))
+}
 
-        import_remap_map.insert(existing_import_position, final_import_index);
-        new_import_map.push(builder.legacy_package.imports[existing_import_position].clone());
-    }
-    builder.legacy_package.imports = new_import_map;
+fn remap_legacy_import_references(legacy_package: &mut FLegacyPackageHeader, import_remap: &HashMap<usize, usize>) -> anyhow::Result<()> {
+    let package_name = legacy_package.summary.package_name.clone();
+    let remap = |package_index| remap_package_index(package_index, import_remap, &package_name);
 
-    // Remap existing references to the imports in the import and export maps
-    let remap_package_index = |package_index: FPackageIndex| -> FPackageIndex {
-        if package_index.is_import() {
-            let new_import_index = *import_remap_map.get(&(package_index.to_import_index() as usize)).unwrap();
-            return FPackageIndex::create_import(new_import_index as u32);
-        }
-        package_index
-    };
-
-    for x in builder.legacy_package.exports.iter_mut() {
-        x.class_index = remap_package_index(x.class_index);
-        x.super_index = remap_package_index(x.super_index);
-        x.template_index = remap_package_index(x.template_index);
-        x.outer_index = remap_package_index(x.outer_index);
+    for x in legacy_package.exports.iter_mut() {
+        x.class_index = remap(x.class_index)?;
+        x.super_index = remap(x.super_index)?;
+        x.template_index = remap(x.template_index)?;
+        x.outer_index = remap(x.outer_index)?;
     }
-    for x in builder.legacy_package.imports.iter_mut() {
-        x.outer_index = remap_package_index(x.outer_index);
+    for x in legacy_package.imports.iter_mut() {
+        x.outer_index = remap(x.outer_index)?;
     }
-    for x in builder.legacy_package.data_resources.iter_mut() {
-        x.outer_index = remap_package_index(x.outer_index);
+    for x in legacy_package.data_resources.iter_mut() {
+        x.outer_index = remap(x.outer_index)?;
     }
-    for x in builder.legacy_package.preload_dependencies.iter_mut() {
-        *x = remap_package_index(*x);
+    for x in legacy_package.preload_dependencies.iter_mut() {
+        *x = remap(*x)?;
     }
-    for x in builder.legacy_package.cell_imports.iter_mut() {
-        x.package_index = remap_package_index(x.package_index);
+    for x in legacy_package.cell_imports.iter_mut() {
+        x.package_index = remap(x.package_index)?;
     }
     Ok(())
+}
+
+fn finalize_asset(builder: &mut LegacyAssetBuilder) -> anyhow::Result<()> {
+    let zen_import_count = builder.zen_package.import_map.len();
+    let reorder_plan = build_import_reorder_plan(builder.legacy_package.imports.len(), zen_import_count, &builder.original_import_order)?;
+
+    // Placeholders mean information was lost; log once unless import resolution already reported it
+    if !builder.has_failed_import_map_entries && reorder_plan.import_order.iter().any(Option::is_none) {
+        info!(
+            builder.package_context.log,
+            "Failed to find import map entries to fill every hole in the import map of size {} for package {}. Null import map entries will be used instead",
+            reorder_plan.import_order.len(),
+            builder.legacy_package.summary.package_name.clone()
+        );
+    }
+
+    let current_imports = std::mem::take(&mut builder.legacy_package.imports);
+    let mut new_import_map: Vec<FObjectImport> = Vec::with_capacity(reorder_plan.import_order.len());
+    for slot in &reorder_plan.import_order {
+        match slot {
+            Some(current_import_index) => new_import_map.push(current_imports[*current_import_index].clone()),
+            // A slot no import references can be a package entry, which becomes Null again if the asset is converted back to zen
+            None => new_import_map.push(create_unknown_package_import_map_entry(builder)),
+        }
+    }
+    builder.legacy_package.imports = new_import_map;
+    remap_legacy_import_references(&mut builder.legacy_package, &reorder_plan.import_remap)
 }
 
 // Builds an asset from zen container, returns a builder that can be used to write the payload to the file or read it directly
@@ -1490,4 +1563,158 @@ pub fn build_legacy(package_context: &FZenPackageContext, package_id: FPackageId
     // Write the asset to the file
     write_asset(&asset_builder, out_path, file_writer)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::container_header::StoreEntry;
+    use crate::iostore::{ChunkInfo, PackageInfo};
+    use crate::script_objects::FPackageImportReference;
+    use crate::{EIoStoreTocVersion, FIoChunkIdRaw};
+
+    // A store with no chunks: every package lookup fails, as for a dependency that ships in no container
+    struct EmptyStore;
+    impl IoStoreTrait for EmptyStore {
+        fn container_name(&self) -> &str {
+            "empty"
+        }
+        fn container_file_version(&self) -> Option<EIoStoreTocVersion> {
+            None
+        }
+        fn container_header_version(&self) -> Option<EIoContainerHeaderVersion> {
+            None
+        }
+        fn print_info(&self, _depth: usize) {}
+        fn read(&self, chunk_id: FIoChunkId) -> anyhow::Result<Vec<u8>> {
+            bail!("chunk {chunk_id:?} not found")
+        }
+        fn read_raw(&self, chunk_id_raw: FIoChunkIdRaw) -> anyhow::Result<Vec<u8>> {
+            bail!("chunk {chunk_id_raw:?} not found")
+        }
+        fn has_chunk_id(&self, _chunk_id: FIoChunkId) -> bool {
+            false
+        }
+        fn has_chunk_id_raw(&self, _chunk_id_raw: FIoChunkIdRaw) -> bool {
+            false
+        }
+        fn chunks(&self) -> Box<dyn Iterator<Item = ChunkInfo<'_>> + Send + '_> {
+            Box::new(std::iter::empty())
+        }
+        fn chunks_all(&self) -> Box<dyn Iterator<Item = ChunkInfo<'_>> + Send + '_> {
+            Box::new(std::iter::empty())
+        }
+        fn packages(&self) -> Box<dyn Iterator<Item = PackageInfo<'_>> + Send + '_> {
+            Box::new(std::iter::empty())
+        }
+        fn packages_all(&self) -> Box<dyn Iterator<Item = PackageInfo<'_>> + Send + '_> {
+            Box::new(std::iter::empty())
+        }
+        fn child_containers(&self) -> Box<dyn Iterator<Item = &dyn IoStoreTrait> + '_> {
+            Box::new(std::iter::empty())
+        }
+        fn chunk_path(&self, _chunk_id: FIoChunkId) -> Option<String> {
+            None
+        }
+        fn package_store_entry(&self, _package_id: FPackageId) -> Option<StoreEntry> {
+            None
+        }
+        fn lookup_package_redirect(&self, _source_package_id: FPackageId) -> Option<FPackageId> {
+            None
+        }
+    }
+
+    const MISSING_PACKAGE: &str = "/Game/Marvel/Characters/1048/1048300/Meshes/SK_1048_1048300_Lobby_PhysicsAsset";
+
+    fn header_importing_missing_package(public_export_hash: u64) -> FZenPackageHeader {
+        FZenPackageHeader {
+            container_header_version: EIoContainerHeaderVersion::LocalizedPackages,
+            imported_packages: vec![FPackageId::from_name(MISSING_PACKAGE)],
+            imported_package_names: vec![MISSING_PACKAGE.to_string()],
+            imported_public_export_hashes: vec![public_export_hash],
+            ..Default::default()
+        }
+    }
+
+    fn resolve_first_import(header: &FZenPackageHeader) -> anyhow::Result<ResolvedZenImport> {
+        let store = EmptyStore;
+        let log = Log::new_stdout(false, false);
+        let context = FZenPackageContext::create(&store, None, &log, None);
+        let import = FPackageObjectIndex::create_package_import(FPackageImportReference {
+            imported_package_index: 0,
+            imported_public_export_hash_index: 0,
+        });
+        resolve_package_import(&context, header, import)
+    }
+
+    #[test]
+    fn unresolvable_top_level_import_keeps_its_package_path() {
+        let header = header_importing_missing_package(get_public_export_hash("sk_1048_1048300_lobby_physicsasset"));
+
+        let resolved = resolve_first_import(&header).expect("import of a missing package whose hash matches its leaf name resolves");
+
+        assert_eq!(resolved.object_name, "SK_1048_1048300_Lobby_PhysicsAsset");
+        assert_eq!(resolved.class_package, "/Script/CoreUObject");
+        assert_eq!(resolved.class_name, "Object");
+        let outer = resolved.outer.expect("the export's outer is its package");
+        assert_eq!(outer.object_name, MISSING_PACKAGE);
+        assert_eq!(outer.class_name, "Package");
+        assert!(outer.outer.is_none());
+    }
+
+    #[test]
+    fn unresolvable_import_of_a_subobject_still_fails() {
+        // A subobject's hash is not the package leaf name's, so nothing names the import
+        let header = header_importing_missing_package(get_public_export_hash("sk_1048_1048300_lobby_physicsasset.bodysetup_0"));
+
+        assert!(resolve_first_import(&header).is_err());
+    }
+
+    fn positions(entries: &[(usize, usize)]) -> HashMap<usize, usize> {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn import_reorder_keeps_imports_beyond_duplicated_zen_slots() {
+        // Zen slots 0 and 1 both resolve to temporary import 0; temporaries 2 and 3 were added while resolving
+        let plan = build_import_reorder_plan(4, 3, &positions(&[(0, 0), (1, 0), (2, 1)])).unwrap();
+
+        assert_eq!(plan.import_order, vec![Some(0), Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!(plan.import_remap, positions(&[(0, 1), (1, 2), (2, 3), (3, 4)]));
+    }
+
+    #[test]
+    fn import_reorder_fills_unclaimed_zen_slots_before_appending() {
+        let plan = build_import_reorder_plan(3, 4, &positions(&[(0, 0), (1, 2)])).unwrap();
+
+        assert_eq!(plan.import_order, vec![Some(0), Some(2), Some(1), None]);
+        assert_eq!(plan.import_remap, positions(&[(0, 0), (2, 1), (1, 2)]));
+    }
+
+    #[test]
+    fn import_reorder_keeps_one_to_one_order() {
+        let plan = build_import_reorder_plan(2, 2, &positions(&[(0, 0), (1, 1)])).unwrap();
+
+        assert_eq!(plan.import_order, vec![Some(0), Some(1)]);
+        assert_eq!(plan.import_remap, positions(&[(0, 0), (1, 1)]));
+    }
+
+    #[test]
+    fn import_reorder_rejects_positions_outside_either_map() {
+        assert!(build_import_reorder_plan(2, 2, &positions(&[(2, 0)])).is_err());
+        assert!(build_import_reorder_plan(2, 2, &positions(&[(0, 2)])).is_err());
+    }
+
+    #[test]
+    fn remapping_an_unpreserved_import_is_an_error_not_a_panic() {
+        let mut package = FLegacyPackageHeader {
+            exports: vec![FObjectExport {
+                class_index: FPackageIndex::create_import(5),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(remap_legacy_import_references(&mut package, &positions(&[(0, 0)])).is_err());
+    }
 }
